@@ -1,0 +1,37 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+venv_server/
+.venv/
+
+# ─── Secrets / env ───
+.env
+*.env
+!.env.example
+
+# ─── Databases ───
+*.sqlite
+*.sqlite-*
+*.db
+
+# ─── Runtime ingested data ───
+backend/data/
+
+# ─── Node / Next.js ───
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-error.log*
+
+# ─── Logs ───
+*.log
+
+# ─── OS / editor ───
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

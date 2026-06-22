@@ -1,0 +1,18 @@
+[Unit]
+Description=Vnotice CVE Monitoring Frontend (Next.js)
+After=network-online.target vnotice-backend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/vnotice/vnotice/frontend
+Environment=NODE_ENV=production
+Environment=PATH=/home/vnotice/.nvm/versions/node/v20.20.2/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/vnotice/.nvm/versions/node/v20.20.2/bin/npm start -- -p 4000
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/vnotice/frontend.log
+StandardError=append:/home/vnotice/frontend.log
+
+[Install]
+WantedBy=default.target
