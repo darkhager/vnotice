@@ -46,6 +46,7 @@ class CVEResponse(BaseModel):
     product: Optional[str] = None
     reference_url: Optional[str] = None
     rss_source: Optional[str] = None
+    keywords: Optional[List[str]] = None
     created_at: Optional[datetime] = None
 
     class Config:
@@ -196,6 +197,14 @@ class EmailTestRequest(BaseModel):
     smtp_username: str
     smtp_password: str
     to_address: str
+    # ponytail: optional CVE payload — when present this endpoint sends a real
+    # alert email (the per-alert "send latest match" button) instead of the
+    # generic test body. Keeps the endpoint unauthenticated like the other tests.
+    cve_id: Optional[str] = None
+    title: Optional[str] = None
+    severity: Optional[str] = None
+    description: Optional[str] = None
+    reference_url: Optional[str] = None
 
 # SMS (Twilio)
 class SmsAlertRequest(NotifAlertRequest):

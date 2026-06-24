@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Vnotice CVE feeds hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

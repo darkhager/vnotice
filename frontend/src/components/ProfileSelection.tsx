@@ -34,6 +34,7 @@ interface ProfileSelectionProps {
   profiles: UserProfile[];
   onSelectProfile: (id: string) => void;
   onCreateProfile: (profile: UserProfile) => void;
+  defaultProfileId?: string;   // shown first and badged as the default account
 }
 
 const avatars = ["🛡️", "🕵️", "💻", "🚀", "⚡", "⚙️"];
@@ -42,7 +43,11 @@ export default function ProfileSelection({
   profiles,
   onSelectProfile,
   onCreateProfile,
+  defaultProfileId,
 }: ProfileSelectionProps) {
+  // Default (admin) account first, everything else after.
+  const ordered = [...profiles].sort((a, b) =>
+    a.id === defaultProfileId ? -1 : b.id === defaultProfileId ? 1 : 0);
   const [isCreating, setIsCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const [newAvatar, setNewAvatar] = useState("🛡️");
@@ -94,19 +99,25 @@ export default function ProfileSelection({
         {!isCreating ? (
           <>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-8">
-              {profiles.map((p) => (
+              {ordered.map((p) => {
+                const isDefault = p.id === defaultProfileId;
+                return (
                 <div
                   key={p.id}
                   onClick={() => onSelectProfile(p.id)}
-                  className="glass-panel p-6 rounded-xl text-center cursor-pointer border border-white/5 hover:border-sky-400 hover:shadow-[0_0_20px_rgba(56,189,248,0.25)] transition-all flex flex-col items-center gap-2"
+                  className={`relative glass-panel p-6 rounded-xl text-center cursor-pointer border transition-all flex flex-col items-center gap-2 ${isDefault ? "border-sky-400/60 shadow-[0_0_20px_rgba(56,189,248,0.25)]" : "border-white/5 hover:border-sky-400 hover:shadow-[0_0_20px_rgba(56,189,248,0.25)]"}`}
                 >
+                  {isDefault && (
+                    <span className="absolute top-2 right-2 text-[9px] font-bold bg-sky-500/20 border border-sky-400/40 text-sky-300 px-1.5 py-0.5 rounded-full">★ DEFAULT</span>
+                  )}
                   <div className="text-5xl mb-2 filter drop-shadow-md select-none">{p.avatar}</div>
                   <div className="font-semibold text-lg text-white truncate max-w-full">{p.name}</div>
                   <div className="text-xs text-sky-400 font-medium tracking-wider uppercase">
                     {p.role}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             <div className="text-center relative my-6 flex items-center justify-center">

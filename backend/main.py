@@ -8,6 +8,7 @@ from datetime import timedelta, datetime
 import random
 import uuid
 import re
+import json
 import asyncio
 import smtplib
 import ssl
@@ -21,6 +22,7 @@ import models
 import schemas
 import auth
 import source_store
+import resource_monitor
 from database import get_db, engine, SessionLocal
 from rss_parser import RSSIngestionService
 
@@ -30,6 +32,20 @@ _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 0
 
 # Create all tables on startup
 models.Base.metadata.create_all(bind=engine)
+
+# ponytail: lightweight additive migration — create_all() won't ALTER existing
+# tables, so add the keywords column to a pre-existing cves table if missing.
+def _ensure_columns():
+    try:
+        with engine.begin() as conn:
+            try:
+                conn.exec_driver_sql("ALTER TABLE cves ADD COLUMN keywords TEXT")
+            except Exception:
+                pass  # column already exists
+    except Exception as e:
+        logger.warning(f"keywords column migration skipped: {e}")
+
+_ensure_columns()
 
 # Fail-safe: if the DB is empty but per-source files exist, rebuild the DB from
 # them (e.g. after a lost/corrupt cvedb.sqlite). Files are the durable copy.
@@ -450,6 +466,9 @@ def sync_threat_sources(
             key = (item["cve_id"], source_name)
             if key in existing_pairs:
                 continue
+            item["keywords"] = RSSIngestionService.extract_keywords(
+                item.get("title", ""), item.get("description", ""),
+                item.get("vendor", ""), item.get("product", ""))
             db.add(models.CVE(
                 cve_id=item["cve_id"],
                 title=item["title"],
@@ -463,6 +482,7 @@ def sync_threat_sources(
                 product=item["product"],
                 reference_url=item["reference_url"],
                 rss_source=source_name,
+                keywords=item["keywords"],
             ))
             existing_pairs.add(key)
             existing_ids.add(item["cve_id"])
@@ -485,6 +505,15 @@ def sync_threat_sources(
             continue
         if "security.paloaltonetworks.com" in feed.url:
             _insert_items(RSSIngestionService.fetch_paloalto_advisories(), feed.name)
+            continue
+        if "access.redhat.com" in feed.url:
+            _insert_items(RSSIngestionService.fetch_redhat_advisories(), feed.name)
+            continue
+        if "resf.org" in feed.url or "rockylinux.org" in feed.url:
+            _insert_items(RSSIngestionService.fetch_rocky_advisories(), feed.name)
+            continue
+        if "msrc.microsoft.com" in feed.url or "microsoft.com/cvrf" in feed.url:
+            _insert_items(RSSIngestionService.fetch_microsoft_advisories(), feed.name)
             continue
 
         # Standard XML / RSS / Atom ingestion
@@ -511,6 +540,8 @@ def sync_threat_sources(
                     "vendor": vendor,
                     "product": product,
                     "reference_url": item["reference_url"],
+                    "keywords": RSSIngestionService.extract_keywords(
+                        item["title"], item["description"], vendor, product),
                 }
                 db.add(models.CVE(**record, rss_source=feed.name))
                 synced_by_source.setdefault(feed.name, []).append(record)
@@ -531,11 +562,28 @@ def sync_threat_sources(
                     "epss", "published_date", "updated_date", "vendor",
                     "product", "reference_url",
                 ]}
+                record["keywords"] = RSSIngestionService.extract_keywords(
+                    details["title"], details["description"],
+                    details["vendor"], details["product"])
                 db.add(models.CVE(**record, rss_source=details["rss_source"]))
                 synced_by_source.setdefault(scraper.name, []).append(record)
                 existing_ids.add(cve_id)
                 existing_pairs.add((cve_id, scraper.name))
                 new_cves_added += 1
+
+    # Real EPSS from FIRST.org (batched) for everything ingested this sync.
+    # A CVE the API doesn't know => None, surfaced as "N/A" (no more random values).
+    pending_cves = [o for o in db.new if isinstance(o, models.CVE)]
+    all_ids = {o.cve_id for o in pending_cves}
+    for recs in synced_by_source.values():
+        all_ids.update(r["cve_id"] for r in recs)
+    if all_ids:
+        epss_scores = RSSIngestionService.fetch_epss_batch(list(all_ids))
+        for o in pending_cves:
+            o.epss = epss_scores.get((o.cve_id or "").upper())
+        for recs in synced_by_source.values():
+            for r in recs:
+                r["epss"] = epss_scores.get((r["cve_id"] or "").upper())
 
     # Fail-safe: write each source's CVEs to its per-source file BEFORE the DB
     # commit, so the durable copy survives even if the commit fails.
@@ -584,6 +632,31 @@ def clear_checkpoint_cves(
     return {"deleted": deleted, "message": f"Removed {deleted} Check Point CVE records."}
 
 
+@app.get("/keywords/")
+def list_keywords(
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """Aggregated keyword store — top extracted keywords across all CVEs with counts.
+
+    Powers keyword discovery (e.g. picking alert keywords) from the terms the
+    extraction algorithm pulled out of ingested feed data and product names.
+    """
+    counts = {}
+    try:
+        for (kw_json,) in db.query(models.CVE.keywords).all():
+            if not kw_json:
+                continue
+            kws = kw_json if isinstance(kw_json, list) else json.loads(kw_json)
+            for kw in kws:
+                counts[kw] = counts.get(kw, 0) + 1
+    except Exception as e:
+        logger.error(f"keyword aggregation failed: {e}")
+        return {"total": 0, "keywords": []}
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    return {"total": len(counts), "keywords": [{"keyword": k, "count": c} for k, c in top]}
+
+
 @app.get("/")
 def root():
     return {"message": "CVE Monitoring API v1.0"}
@@ -596,9 +669,47 @@ def root():
 import time as _time
 _APP_START = _time.time()
 
+def _vnotice_subprocesses() -> list:
+    """Best-effort list of the OS processes that make up this deployment —
+    backend (uvicorn) + frontend (Next.js) — so Engine Status shows every
+    subprocess, not just the API process. ponytail: psutil cmdline match,
+    scoped to the current user's own processes."""
+    procs: list = []
+    try:
+        import psutil
+        me = psutil.Process().username()
+    except Exception:
+        return procs
+    for p in psutil.process_iter(["pid", "name", "cmdline", "status", "create_time", "username"]):
+        try:
+            if p.info.get("username") != me:
+                continue
+            cmd = " ".join(p.info.get("cmdline") or []).lower()
+            name = (p.info.get("name") or "").lower()
+            if "uvicorn" in cmd and "main:app" in cmd:
+                role = "Backend API (uvicorn)"
+            elif "next-server" in name or "next-server" in cmd or ("node" in name and "next" in cmd):
+                role = "Frontend (Next.js)"
+            else:
+                continue
+            procs.append({
+                "role": role,
+                "name": p.info.get("name"),
+                "pid": p.info.get("pid"),
+                "status": p.info.get("status"),
+                "mem_mb": round(p.memory_info().rss / 1e6, 1),
+                "threads": p.num_threads(),
+                "uptime_seconds": round(_time.time() - (p.info.get("create_time") or _time.time())),
+            })
+        except Exception:
+            continue
+    procs.sort(key=lambda x: x["role"])
+    return procs
+
+
 @app.get("/health/")
 def engine_health(db: Session = Depends(get_db)):
-    """Return CPU, memory, disk usage, DB status, and uptime."""
+    """Return CPU, memory, disk usage, DB status, uptime, and subprocesses."""
     result: dict = {
         "api_version": "1.0.0",
         "uptime_seconds": round(_time.time() - _APP_START),
@@ -655,7 +766,36 @@ def engine_health(db: Session = Depends(get_db)):
     except Exception as e:
         result["metrics_error"] = str(e)
 
+    result["subprocesses"] = _vnotice_subprocesses()
     return result
+
+
+@app.on_event("startup")
+async def _start_resource_sampler():
+    """Begin recording host CPU/mem/disk % once per hour (kept ~365 days)."""
+    asyncio.create_task(resource_monitor.sampler_loop())
+
+
+@app.get("/metrics/usage")
+def resource_usage_history():
+    """Hourly CPU/mem/disk % history for the resource-usage dashboard."""
+    return {"interval_seconds": 3600, "samples": resource_monitor.load_history()}
+
+
+@app.post("/cves/refresh-epss")
+def refresh_epss(db: Session = Depends(get_db)):
+    """Backfill REAL EPSS scores from FIRST.org for every stored CVE (batched).
+    CVEs the API has no score for are set to None (displayed as N/A)."""
+    rows = db.query(models.CVE).all()
+    scores = RSSIngestionService.fetch_epss_batch([r.cve_id for r in rows])
+    found = 0
+    for r in rows:
+        val = scores.get((r.cve_id or "").upper())
+        r.epss = val
+        if val is not None:
+            found += 1
+    db.commit()
+    return {"total": len(rows), "with_epss": found, "na": len(rows) - found}
 
 
 # ─────────────────────────────────────────
@@ -905,6 +1045,16 @@ def _smtp_auth_detail(exc: smtplib.SMTPAuthenticationError) -> str:
 
 def _send_smtp(host: str, port: int, username: str, password: str,
                to_address: str, subject: str, body_html: str) -> None:
+    # Empty host makes smtplib skip connect() and later fail with the cryptic
+    # "please run connect() first" — guard with a clear, actionable message.
+    if not (host or "").strip():
+        raise smtplib.SMTPException(
+            "SMTP host is not configured. Set the mail server (host/username/password) "
+            "in Settings → Email Alerts.")
+    if not (username or "").strip() or not (to_address or "").strip():
+        raise smtplib.SMTPException(
+            "SMTP username and recipient address are required. Complete them in "
+            "Settings → Email Alerts.")
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = username
@@ -956,14 +1106,30 @@ async def send_email_alert(
 async def test_email_config(
     req: schemas.EmailTestRequest,
 ):
-    subject = "[Vnotice] Test Notification"
-    body = "<html><body><p>✅ <b>CVE Monitor — Test Alert</b><br>Email notifications are configured correctly.</p></body></html>"
+    if req.cve_id:
+        # ponytail: a CVE was supplied → send the real alert body (per-alert "send latest match").
+        sev = (req.severity or "Medium").upper()
+        subject = f"[Vnotice Alert] {req.cve_id} — {sev}"
+        body = (
+            '<html><body style="font-family:sans-serif">'
+            f'<h2 style="color:#c0392b">🚨 CVE Alert: {req.cve_id}</h2><table>'
+            f'<tr><td><b>Title</b></td><td>{req.title or req.cve_id}</td></tr>'
+            f'<tr><td><b>Severity</b></td><td>{sev}</td></tr>'
+            + (f'<tr><td><b>Description</b></td><td>{req.description}</td></tr>' if req.description else '')
+            + (f'<tr><td><b>Reference</b></td><td><a href="{req.reference_url}">{req.reference_url}</a></td></tr>' if req.reference_url else '')
+            + '</table></body></html>'
+        )
+        ok_msg = f"Alert email for {req.cve_id} sent to {req.to_address}."
+    else:
+        subject = "[Vnotice] Test Notification"
+        body = "<html><body><p>✅ <b>CVE Monitor — Test Alert</b><br>Email notifications are configured correctly.</p></body></html>"
+        ok_msg = f"Test email sent to {req.to_address}."
     try:
         await asyncio.get_event_loop().run_in_executor(
             None, _send_smtp, req.smtp_host, req.smtp_port,
             req.smtp_username, req.smtp_password, req.to_address, subject, body
         )
-        return {"status": "ok", "message": f"Test email sent to {req.to_address}."}
+        return {"status": "ok", "message": ok_msg}
     except smtplib.SMTPAuthenticationError as exc:
         raise HTTPException(status_code=401, detail=_smtp_auth_detail(exc))
     except smtplib.SMTPException as exc:

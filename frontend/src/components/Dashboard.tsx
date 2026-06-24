@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useMemo } from "react";
 import ProfileSelection from "./ProfileSelection";
 import CveTable from "./CveTable";
-import { ShieldAlert, Sun, Moon, LogOut, Save, Trash2, RefreshCw, X } from "lucide-react";
+import { ShieldAlert, Sun, Moon, LogOut, Save, Trash2, RefreshCw, X, Mail, Search } from "lucide-react";
 import { getApiBase } from "../lib/api";
 
 interface UserProfile {
@@ -24,6 +24,7 @@ interface UserProfile {
     smsTwilioSid?: string;
     smsTwilioToken?: string;
     smsPhoneNumber?: string;
+    useAdminSmtp?: boolean;        // borrow the admin account's SMTP config
   };
   credentials: {
     smtpHost?: string;
@@ -56,6 +57,8 @@ interface AlertRule {
   filters: AlertFilter;          // primary group — kept for backward compatibility
   conditions?: AlertFilter[];    // OR'd condition groups; a CVE matches if ANY group matches
   createdAt: string;
+  lastSentAt?: string;           // ISO time this alert last sent a test email
+  sentCount?: number;            // how many emails this alert has sent
 }
 
 interface SavedDashboard {
@@ -215,7 +218,7 @@ function mapApiCve(c: any) {
     product:  product || "Various",
     severity: (c.severity || "Medium") as any,
     score:    c.cvss_score || 0.0,
-    epss:     c.epss       || 0.0,
+    epss:     c.epss ?? null,   // null => EPSS unknown, shown as N/A
     date:     c.published_date ? c.published_date.split("T")[0] : "Unknown",
     url:      c.reference_url || "",
     description: c.description || "",
@@ -367,6 +370,7 @@ export default function Dashboard() {
   const [epssMax, setEpssMax] = useState<string>("");
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isRefreshingEpss, setIsRefreshingEpss] = useState(false);
   const [syncCountdown, setSyncCountdown] = useState<number>(900);
   const [vulnerabilities, setVulnerabilities] = useState<any[]>([]);
 
@@ -389,9 +393,30 @@ export default function Dashboard() {
     return [];
   });
   const [selectedDashboardId, setSelectedDashboardId] = useState<string | null>(null);
-  const [activeSettingsSection, setActiveSettingsSection] = useState<"account" | "alerts" | "console" | "accounts" | "engine">("account");
+  const [activeSettingsSection, setActiveSettingsSection] = useState<"account" | "alerts" | "console" | "accounts" | "engine" | "resource">("account");
   const [engineHealth, setEngineHealth] = useState<any>(null);
   const [engineHealthLoading, setEngineHealthLoading] = useState(false);
+  const [usageData, setUsageData] = useState<any[]>([]);
+  const [usageLoading, setUsageLoading] = useState(false);
+  const [usageRange, setUsageRange] = useState(1);   // days shown (1 = last 24h)
+
+  const loadUsage = async () => {
+    setUsageLoading(true);
+    try {
+      const res = await fetch(`${getApiBase()}/metrics/usage`);
+      const data = res.ok ? await res.json() : { samples: [] };
+      setUsageData(Array.isArray(data.samples) ? data.samples : []);
+    } catch {
+      setUsageData([]);
+    }
+    setUsageLoading(false);
+  };
+
+  // Auto-load usage history when the Resource Usage section is opened.
+  useEffect(() => {
+    if (activeSettingsSection === "resource") loadUsage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSettingsSection]);
 
   const handleEngineHealthCheck = async () => {
     setEngineHealthLoading(true);
@@ -405,6 +430,13 @@ export default function Dashboard() {
     }
     setEngineHealthLoading(false);
   };
+
+  // Auto-load engine health when the Engine Status section is opened.
+  useEffect(() => {
+    if (activeSettingsSection === "engine") handleEngineHealthCheck();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSettingsSection]);
+
   const [showColMgr, setShowColMgr] = useState(false);
 
   // Custom Webpage Regex Scraper states (Req 2)
@@ -438,6 +470,7 @@ export default function Dashboard() {
   const [smtpPort, setSmtpPort] = useState("587");
   const [smtpUsername, setSmtpUsername] = useState("");
   const [smtpPassword, setSmtpPassword] = useState("");
+  const [useAdminSmtp, setUseAdminSmtp] = useState(false);
   const [emailAlertsEnabled, setEmailAlertsEnabled] = useState(true);
   const [profileSaved, setProfileSaved] = useState(false);
 
@@ -524,9 +557,9 @@ export default function Dashboard() {
       loadedProfiles = [
         {
           id: "default",
-          name: "Default Operator",
+          name: "Admin",
           avatar: "🛡️",
-          role: "System Admin",
+          role: "Administrator",
           email: "admin@vnotice.local",
           preferences: {
             theme: "dark",
@@ -559,6 +592,8 @@ export default function Dashboard() {
         "advisories.splunk.com",
         "tools.cisco.com/security/center/rss",  // returns HTML page, not RSS
         "support.f5.com/csp/feed",              // returns HTML login page
+        "vulners.com/rss.xml",                  // feed returns nothing usable
+        "seclists.org/rss/fulldisclosure.rss",  // Full Disclosure — feed returns nothing usable
       ];
       const before = loadedFeeds.length;
       loadedFeeds = loadedFeeds.filter((f: Feed) =>
@@ -569,10 +604,11 @@ export default function Dashboard() {
         { name: "NVD / NIST CVE",    url: "https://services.nvd.nist.gov/rest/json/cves/2.0",    active: true },
         { name: "Splunk Security Advisories", url: "https://advisory.splunk.com/advisories",      active: true },
         { name: "Check Point Advisories", url: "https://support.checkpoint.com/security-advisories", active: true },
+        { name: "Red Hat (RHEL)",    url: "https://access.redhat.com/hydra/rest/securitydata/cve.json", active: true },
+        { name: "Rocky Linux",       url: "https://apollo.build.resf.org/api/v3/advisories/",     active: true },
+        { name: "Microsoft (Windows)", url: "https://api.msrc.microsoft.com/cvrf/v3.0/updates",   active: true },
         { name: "Ubuntu Security",   url: "https://ubuntu.com/security/notices/rss.xml",          active: true },
-        { name: "Vulners RSS",       url: "https://vulners.com/rss.xml",                          active: true },
         { name: "CERT.PL Security",  url: "https://cert.pl/en/rss.xml",                          active: true },
-        { name: "Full Disclosure",   url: "https://seclists.org/rss/fulldisclosure.rss",          active: true },
       ];
       for (const nf of newFeeds) {
         if (!loadedFeeds.some((f: Feed) => f.url === nf.url)) {
@@ -595,10 +631,14 @@ export default function Dashboard() {
         { name: "Check Point Advisories", url: "https://support.checkpoint.com/security-advisories", active: true },
         // OS / distro security
         { name: "Ubuntu Security", url: "https://ubuntu.com/security/notices/rss.xml", active: true },
+        // Red Hat Security Data API (JSON) — real CVSS/severity
+        { name: "Red Hat (RHEL)", url: "https://access.redhat.com/hydra/rest/securitydata/cve.json", active: true },
+        // Rocky Linux errata via RESF Apollo API (JSON)
+        { name: "Rocky Linux", url: "https://apollo.build.resf.org/api/v3/advisories/", active: true },
+        // Microsoft / Windows via MSRC CVRF API (JSON) — latest Patch Tuesday
+        { name: "Microsoft (Windows)", url: "https://api.msrc.microsoft.com/cvrf/v3.0/updates", active: true },
         // Global aggregators — confirmed working
-        { name: "Vulners RSS", url: "https://vulners.com/rss.xml", active: true },
         { name: "CERT.PL Security", url: "https://cert.pl/en/rss.xml", active: true },
-        { name: "Full Disclosure", url: "https://seclists.org/rss/fulldisclosure.rss", active: true },
       ];
       localStorage.setItem("vnotice_rss_feeds", JSON.stringify(loadedFeeds));
     }
@@ -650,36 +690,8 @@ export default function Dashboard() {
     }
     setVulnerabilities(loadedVulns);
 
-    // Load Alert Rules — migrate old shape if needed
-    const storedRules = localStorage.getItem("vnotice_alert_rules");
-    let loadedRules: AlertRule[] = [];
-    if (storedRules) {
-      try {
-        const parsed = JSON.parse(storedRules);
-        loadedRules = (parsed as any[]).map((r: any) => {
-          if (r.filters) {
-            // Ensure a conditions[] array exists (older rules only had `filters`).
-            return { ...r, conditions: (r.conditions && r.conditions.length) ? r.conditions : [r.filters] } as AlertRule;
-          }
-          // migrate oldest shape
-          const f: AlertFilter = {
-            severity: ["all"], keywords: [], feedSources: ["all"],
-            searchQuery: r.searchQuery || "", epssMin: "", epssMax: "",
-          };
-          return {
-            id: r.id || generateUniqueId(),
-            name: r.name || "Unnamed Rule",
-            description: "",
-            active: r.active !== undefined ? r.active : true,
-            filters: f,
-            conditions: [f],
-            createdAt: new Date().toISOString(),
-          } as AlertRule;
-        });
-      } catch {}
-    }
-    localStorage.setItem("vnotice_alert_rules", JSON.stringify(loadedRules));
-    setAlertRules(loadedRules);
+    // Alert rules are loaded per-account when a profile is selected (see the
+    // activeProfileId effect) so they stay separated between operators.
 
     // Load Webpage scrapers (Req 2)
     const storedScrapers = localStorage.getItem("vnotice_web_scrapers");
@@ -728,16 +740,70 @@ export default function Dashboard() {
 
   const activeProfile = profiles.find((p) => p.id === activeProfileId);
 
+  // ─── Admin account (holds the canonical SMTP config; is the default account) ───
+  const isAdminProfile = (p?: UserProfile | null) => !!p && /admin/i.test(p.role || "");
+  const adminProfile = (): UserProfile | undefined =>
+    profiles.find((p) => /admin/i.test(p.role || "")) ||
+    profiles.find((p) => p.id === "default") || profiles[0];
+
+  // ─── Per-account alert-rule storage (security: never share rules across accounts) ───
+  const alertRulesKey = (pid: string) => `vnotice_alert_rules_${pid}`;
+
+  const migrateRule = (r: any): AlertRule => {
+    if (r.filters) {
+      return { ...r, conditions: (r.conditions && r.conditions.length) ? r.conditions : [r.filters] } as AlertRule;
+    }
+    const f: AlertFilter = {
+      severity: ["all"], keywords: [], feedSources: ["all"],
+      searchQuery: r.searchQuery || "", epssMin: "", epssMax: "",
+    };
+    return {
+      id: r.id || generateUniqueId(),
+      name: r.name || "Unnamed Rule",
+      description: "",
+      active: r.active !== undefined ? r.active : true,
+      filters: f, conditions: [f],
+      createdAt: new Date().toISOString(),
+    } as AlertRule;
+  };
+
+  const loadAlertRulesFor = (pid: string): AlertRule[] => {
+    let raw = localStorage.getItem(alertRulesKey(pid));
+    // ponytail: one-time migration — adopt the old shared rules into the first
+    // account opened after this change, then delete the global key for good.
+    if (!raw) {
+      const legacy = localStorage.getItem("vnotice_alert_rules");
+      if (legacy) {
+        raw = legacy;
+        localStorage.setItem(alertRulesKey(pid), legacy);
+        localStorage.removeItem("vnotice_alert_rules");
+      }
+    }
+    if (!raw) return [];
+    try { return (JSON.parse(raw) as any[]).map(migrateRule); } catch { return []; }
+  };
+
+  const saveAlertRules = (rules: AlertRule[]) => {
+    if (!activeProfileId) return;
+    localStorage.setItem(alertRulesKey(activeProfileId), JSON.stringify(rules));
+  };
+
   useEffect(() => {
     if (activeProfile) {
       setDisplayName(activeProfile.name || "");
       setEmail(activeProfile.email || "");
       setTimezone(activeProfile.preferences?.vulnerabilityMinSeverity || "ICT");
       setTextSize((activeProfile.preferences?.textSize as any) || "md");
-      setSmtpHost(activeProfile.credentials?.smtpHost || "");
-      setSmtpPort(activeProfile.credentials?.smtpPort || "587");
-      setSmtpUsername(activeProfile.credentials?.smtpUser || "");
-      setSmtpPassword(activeProfile.credentials?.smtpPass || "");
+      // Email Alerts: optionally borrow the admin account's SMTP config.
+      const borrow = activeProfile.preferences?.useAdminSmtp || false;
+      setUseAdminSmtp(borrow);
+      const admin = adminProfile();
+      const creds = (borrow && admin && admin.id !== activeProfile.id)
+        ? admin.credentials : activeProfile.credentials;
+      setSmtpHost(creds?.smtpHost || "");
+      setSmtpPort(creds?.smtpPort || "587");
+      setSmtpUsername(creds?.smtpUser || "");
+      setSmtpPassword(creds?.smtpPass || "");
       setEmailAlertsEnabled(activeProfile.preferences?.emailAlertsEnabled !== undefined ? activeProfile.preferences.emailAlertsEnabled : true);
       setTeamsAlertsEnabled(activeProfile.preferences?.teamsAlertsEnabled || false);
       setTeamsWebhookUrl(activeProfile.preferences?.teamsWebhookUrl || "");
@@ -745,8 +811,10 @@ export default function Dashboard() {
       setSmsTwilioSid(activeProfile.preferences?.smsTwilioSid || "");
       setSmsTwilioToken(activeProfile.preferences?.smsTwilioToken || "");
       setSmsPhoneNumber(activeProfile.preferences?.smsPhoneNumber || "");
-      
+
     }
+    // Load this account's alert rules (or clear them on logout) — kept separate per account.
+    setAlertRules(activeProfileId ? loadAlertRulesFor(activeProfileId) : []);
   }, [activeProfileId, activeProfile]);
 
   const applyTheme = (theme: "dark" | "light") => {
@@ -826,13 +894,18 @@ export default function Dashboard() {
         smsTwilioSid: smsTwilioSid.trim(),
         smsTwilioToken: smsTwilioToken.trim(),
         smsPhoneNumber: smsPhoneNumber.trim(),
+        useAdminSmtp: useAdminSmtp,
       },
-      credentials: {
-        smtpHost: smtpHost.trim(),
-        smtpPort: smtpPort.trim(),
-        smtpUser: smtpUsername.trim(),
-        smtpPass: smtpPassword.trim()
-      }
+      // When borrowing admin's SMTP, keep this account's own creds untouched
+      // (so toggling back off restores them). ponytail.
+      credentials: useAdminSmtp
+        ? (activeProfile.credentials || {})
+        : {
+            smtpHost: smtpHost.trim(),
+            smtpPort: smtpPort.trim(),
+            smtpUser: smtpUsername.trim(),
+            smtpPass: smtpPassword.trim(),
+          },
     };
     handleProfileSave(updates);
     setProfileSaved(true);
@@ -886,6 +959,33 @@ export default function Dashboard() {
   const handleStreamSyncModeChange = (mode: string) => {
     setStreamSyncMode(mode);
     localStorage.setItem("vnotice_stream_sync_mode", mode);
+  };
+
+  // Re-pull real EPSS scores from FIRST.org for all stored CVEs (fills newly
+  // available scores and updates changed ones), then reload the grid.
+  const handleRefreshEpss = async () => {
+    setIsRefreshingEpss(true);
+    appendLog(`[NET] Refreshing EPSS scores from FIRST.org...`);
+    try {
+      const res = await fetch(`${getApiBase()}/cves/refresh-epss`, { method: "POST" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const r = await res.json();
+      const cvesRes = await fetch(`${getApiBase()}/cves/?limit=500`);
+      if (cvesRes.ok) {
+        const apiData = await cvesRes.json();
+        const mapped = apiData.map((c: any) => {
+          const v = mapApiCve(c);
+          return { ...v, url: ensureAbsoluteCveUrl(c.reference_url, c.cve_id) };
+        });
+        setVulnerabilities(mapped);
+        localStorage.setItem("vnotice_vulnerabilities", JSON.stringify(mapped));
+      }
+      appendLog(`[NET] EPSS refresh: ${r.with_epss} scored · ${r.na} N/A (of ${r.total}).`);
+      window.alert(`EPSS updated: ${r.with_epss} scored, ${r.na} N/A (of ${r.total}).`);
+    } catch (e) {
+      window.alert(`EPSS refresh failed: ${e instanceof Error ? e.message : "network error"}`);
+    }
+    setIsRefreshingEpss(false);
   };
 
   const handleSyncFeeds = async () => {
@@ -1097,7 +1197,7 @@ export default function Dashboard() {
         v.product,
         v.severity,
         v.score,
-        v.epss,
+        v.epss ?? "N/A",
         v.date
       ];
       csvRows.push(row.join(","));
@@ -1299,6 +1399,56 @@ export default function Dashboard() {
   const countRuleMatches = (r: AlertRule): number =>
     vulnerabilities.filter((v) => ruleGroups(r).some((g) => cveMatchesGroup(v, g))).length;
 
+  // Newest currently-loaded CVE that matches this rule (by ingest time), or null.
+  const latestMatchForRule = (r: AlertRule): any | null => {
+    const matches = vulnerabilities.filter((v) => ruleGroups(r).some((g) => cveMatchesGroup(v, g)));
+    if (!matches.length) return null;
+    // ponytail: sort by ingestedAt (ISO, lexicographic works) desc, fall back to published date
+    return matches.slice().sort((a, b) =>
+      (b.ingestedAt || b.date || "").localeCompare(a.ingestedAt || a.date || ""))[0];
+  };
+
+  // Email the latest matching event for this rule, then stamp lastSentAt on success.
+  const sendAlertTestEmail = async (rule: AlertRule) => {
+    if (!smtpHost.trim() || !smtpUsername.trim() || !smtpPassword.trim() || !email.trim()) {
+      window.alert("Configure email first: set SMTP host, username, password and recipient under Settings → Email Alerts, then Save.");
+      return;
+    }
+    const v = latestMatchForRule(rule);
+    if (!v) {
+      window.alert(`No currently-loaded CVE matches "${rule.name}", so there is nothing to send yet.`);
+      return;
+    }
+    let ok = false;
+    let msg: string;
+    try {
+      const r = await fetch(`${getApiBase()}/notifications/test-email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          smtp_host: smtpHost, smtp_port: parseInt(smtpPort) || 587,
+          smtp_username: smtpUsername, smtp_password: smtpPassword, to_address: email,
+          cve_id: v.id, title: v.name || v.id, severity: v.severity || "Medium",
+          description: v.description || "", reference_url: v.url || "",
+        }),
+      });
+      const data = await r.json().catch(() => ({}));
+      const detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+      ok = r.ok;
+      msg = r.ok ? `✓ Sent ${v.id} to ${email}` : `✗ ${detail || ("HTTP " + r.status)}`;
+    } catch (e) {
+      msg = `✗ ${e instanceof Error ? e.message : "network error"}`;
+    }
+    window.alert(msg);
+    appendLog(`[NET] Alert '${rule.name}' email (${v.id}): ${msg}`);
+    if (ok) {
+      const updated = alertRules.map((x) =>
+        x.id === rule.id ? { ...x, lastSentAt: new Date().toISOString(), sentCount: (x.sentCount || 0) + 1 } : x);
+      setAlertRules(updated);
+      saveAlertRules(updated);
+    }
+  };
+
   const handleSaveAlert = () => {
     if (!saveAlertName.trim()) {
       alert("Alert Name is required.");
@@ -1313,7 +1463,7 @@ export default function Dashboard() {
           : r
       );
       setAlertRules(updated);
-      localStorage.setItem("vnotice_alert_rules", JSON.stringify(updated));
+      saveAlertRules(updated);
       appendLog(`[SYS] Updated Alert Rule: ${saveAlertName.trim()} (${groups.length} condition group${groups.length > 1 ? "s" : ""})`);
     } else {
       const newRule: AlertRule = {
@@ -1327,7 +1477,7 @@ export default function Dashboard() {
       };
       const updated = [...alertRules, newRule];
       setAlertRules(updated);
-      localStorage.setItem("vnotice_alert_rules", JSON.stringify(updated));
+      saveAlertRules(updated);
       appendLog(`[SYS] Saved new Alert Rule: ${newRule.name} (${groups.length} condition group${groups.length > 1 ? "s" : ""})`);
     }
     setShowSaveAlertModal(false);
@@ -1356,7 +1506,7 @@ export default function Dashboard() {
       r.id === id ? { ...r, active: !r.active } : r
     );
     setAlertRules(updated);
-    localStorage.setItem("vnotice_alert_rules", JSON.stringify(updated));
+    saveAlertRules(updated);
     const rule = updated.find((r) => r.id === id);
     appendLog(`[SYS] Alert Rule '${rule?.name}' state switched to: ${rule?.active ? "ACTIVE" : "DISABLED"}`);
   };
@@ -1365,7 +1515,7 @@ export default function Dashboard() {
     const rule = alertRules.find((r) => r.id === id);
     const updated = alertRules.filter((r) => r.id !== id);
     setAlertRules(updated);
-    localStorage.setItem("vnotice_alert_rules", JSON.stringify(updated));
+    saveAlertRules(updated);
     appendLog(`[SYS] Deleted Alert Rule: ${rule?.name}`);
   };
 
@@ -1413,6 +1563,22 @@ export default function Dashboard() {
     appendLog(`[SYS] Applied Dashboard filter: ${dash.name}`);
   };
 
+  // Push an alert rule's filter into the Threat Stream so its matches are visible.
+  const handleApplyAlertFilter = (rule: AlertRule) => {
+    const groups = ruleGroups(rule);
+    const g = groups[0];
+    setActiveSeverity(g.severity && g.severity.length ? g.severity : ["all"]);
+    setActiveKeywords(g.keywords || []);
+    setActiveFeedsFilter(g.feedSources && g.feedSources.length ? g.feedSources : ["all"]);
+    setSearchQuery(g.searchQuery || "");
+    setEpssMin(g.epssMin || "");
+    setEpssMax(g.epssMax || "");
+    setActiveTab("threat_stream");
+    appendLog(groups.length > 1
+      ? `[SYS] Applied Alert '${rule.name}' filter (condition group 1 of ${groups.length}; stream shows one group at a time)`
+      : `[SYS] Applied Alert '${rule.name}' filter to Threat Stream`);
+  };
+
   const activeFeedsCount = feeds.filter((f) => f.active).length;
 
   // Dynamic statistics calculations — memoized; only change when CVE list does.
@@ -1440,6 +1606,7 @@ export default function Dashboard() {
         profiles={profiles}
         onSelectProfile={handleSelectProfile}
         onCreateProfile={handleCreateProfile}
+        defaultProfileId={adminProfile()?.id}
       />
     );
   }
@@ -1925,6 +2092,15 @@ export default function Dashboard() {
                       <span>{isSyncing ? "Syncing..." : "Sync Grid"}</span>
                     </button>
                     <button
+                      onClick={handleRefreshEpss}
+                      disabled={isRefreshingEpss}
+                      className="flex items-center gap-2 px-3 py-1.5 text-[0.8em] font-semibold glass-panel border border-white/10 text-gray-300 hover:text-white hover:bg-white/5 rounded-xl transition duration-200 disabled:opacity-50"
+                      title="Re-pull real EPSS scores from FIRST.org for all CVEs"
+                    >
+                      <RefreshCw className={`w-[1.2em] h-[1.2em] flex-shrink-0 ${isRefreshingEpss ? "animate-spin" : ""}`} />
+                      <span>{isRefreshingEpss ? "Updating..." : "Refresh EPSS"}</span>
+                    </button>
+                    <button
                       onClick={() => setShowColMgr(v => !v)}
                       className={`flex items-center gap-1.5 px-3 py-1.5 text-[0.8em] font-semibold glass-panel border rounded-xl transition duration-200 ${
                         showColMgr
@@ -2106,6 +2282,7 @@ export default function Dashboard() {
                   { id: "account",  icon: "👤", label: "Account Settings",   sub: "Profile · Display" },
                   { id: "alerts",   icon: "🔔", label: "Alert Channels",     sub: "SMTP · Teams · SMS" },
                   { id: "engine",   icon: "🔧", label: "Engine Status",      sub: "Health · Resources" },
+                  { id: "resource", icon: "📊", label: "Resource Usage",     sub: "CPU · Mem · Disk history" },
                   { id: "console",  icon: "💻", label: "System Console",     sub: "Audit logs" },
                   { id: "accounts", icon: "👥", label: "Account Management", sub: "Operator profiles" },
                 ].map(({ id, icon, label, sub }) => (
@@ -2212,12 +2389,44 @@ export default function Dashboard() {
                 <div className="flex items-center justify-between gap-2 border-b border-white/5 pb-2">
                   <h3 className="text-sm font-bold text-sky-400 uppercase tracking-wider">Email Alerts</h3>
                   <button
-                    onClick={() => testNotifier("/notifications/test-email", { smtp_host: smtpHost, smtp_port: parseInt(smtpPort) || 587, smtp_username: smtpUsername, smtp_password: smtpPassword, to_address: email }, "Email")}
+                    onClick={() => {
+                      if (!smtpHost.trim() || !smtpUsername.trim() || !smtpPassword.trim() || !email.trim()) {
+                        window.alert(useAdminSmtp
+                          ? "The admin account has no SMTP configured. Log into the admin account and set SMTP host/username/password under Settings → Email Alerts first."
+                          : "Fill SMTP host, username, password and recipient email before sending a test.");
+                        return;
+                      }
+                      testNotifier("/notifications/test-email", { smtp_host: smtpHost, smtp_port: parseInt(smtpPort) || 587, smtp_username: smtpUsername, smtp_password: smtpPassword, to_address: email }, "Email");
+                    }}
                     className="px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider glass-panel text-sky-300 hover:bg-white/5 border border-white/10 rounded-md transition whitespace-nowrap"
                   >
                     Send Test
                   </button>
                 </div>
+
+                {!isAdminProfile(activeProfile) && (
+                  <label className="flex items-center gap-2.5 cursor-pointer bg-sky-500/5 border border-sky-400/15 rounded-lg p-2.5">
+                    <input
+                      type="checkbox"
+                      checked={useAdminSmtp}
+                      onChange={(e) => {
+                        const on = e.target.checked;
+                        setUseAdminSmtp(on);
+                        const admin = adminProfile();
+                        const creds = on && admin ? admin.credentials : activeProfile?.credentials;
+                        setSmtpHost(creds?.smtpHost || "");
+                        setSmtpPort(creds?.smtpPort || "587");
+                        setSmtpUsername(creds?.smtpUser || "");
+                        setSmtpPassword(creds?.smtpPass || "");
+                      }}
+                      className="w-4 h-4 rounded accent-sky-500"
+                    />
+                    <div className="flex flex-col">
+                      <span className="text-xs font-bold text-white uppercase tracking-wider">Use admin account&apos;s SMTP</span>
+                      <span className="text-[10px] text-gray-400 mt-0.5">Send via the {adminProfile()?.name || "admin"} account&apos;s mail server instead of your own. Alerts still go to your email.</span>
+                    </div>
+                  </label>
+                )}
 
                 <div className="grid grid-cols-3 gap-3">
                   <div className="col-span-2 space-y-1">
@@ -2226,8 +2435,9 @@ export default function Dashboard() {
                       type="text"
                       value={smtpHost}
                       onChange={(e) => setSmtpHost(e.target.value)}
+                      disabled={useAdminSmtp}
                       placeholder="smtp.gmail.com"
-                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-sm transition"
+                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-sm transition disabled:opacity-50 disabled:cursor-not-allowed"
                     />
                   </div>
                   <div className="space-y-1">
@@ -2236,8 +2446,9 @@ export default function Dashboard() {
                       type="text"
                       value={smtpPort}
                       onChange={(e) => setSmtpPort(e.target.value)}
+                      disabled={useAdminSmtp}
                       placeholder="587"
-                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-sm transition"
+                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-sm transition disabled:opacity-50 disabled:cursor-not-allowed"
                     />
                   </div>
                 </div>
@@ -2249,8 +2460,9 @@ export default function Dashboard() {
                       type="text"
                       value={smtpUsername}
                       onChange={(e) => setSmtpUsername(e.target.value)}
+                      disabled={useAdminSmtp}
                       placeholder="alerts@company.com"
-                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-sm transition"
+                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-sm transition disabled:opacity-50 disabled:cursor-not-allowed"
                     />
                   </div>
                   <div className="space-y-1">
@@ -2259,8 +2471,9 @@ export default function Dashboard() {
                       type="password"
                       value={smtpPassword}
                       onChange={(e) => setSmtpPassword(e.target.value)}
+                      disabled={useAdminSmtp}
                       placeholder="••••••••"
-                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-sm transition"
+                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-sm transition disabled:opacity-50 disabled:cursor-not-allowed"
                     />
                   </div>
                 </div>
@@ -2448,25 +2661,21 @@ export default function Dashboard() {
               <div className="border-b border-white/10 pb-4 flex items-start justify-between">
                 <div>
                   <h2 className="text-xl font-bold text-white flex items-center gap-2">🔧 Engine Status</h2>
-                  <p className="text-xs text-gray-400 mt-1">Real-time backend health check — CPU, memory, disk, database, and process info</p>
+                  <p className="text-xs text-gray-400 mt-1">Real-time health check — CPU, memory, disk, database, and every subprocess (backend + frontend)</p>
                 </div>
                 <button
                   onClick={handleEngineHealthCheck}
                   disabled={engineHealthLoading}
-                  className="px-4 py-2 bg-sky-500/20 hover:bg-sky-500/30 border border-sky-500/30 rounded-xl text-sky-400 text-xs font-bold transition flex items-center gap-2 disabled:opacity-50"
+                  className="px-3 py-1.5 text-xs font-bold rounded-lg bg-sky-500/15 border border-sky-400/25 text-sky-300 hover:bg-sky-500/25 transition flex items-center gap-1.5 disabled:opacity-50"
                 >
-                  {engineHealthLoading ? (
-                    <><span className="animate-spin inline-block w-3 h-3 border-2 border-sky-400 border-t-transparent rounded-full" /> Checking...</>
-                  ) : (
-                    <><RefreshCw className="w-3.5 h-3.5" /> Run Health Check</>
-                  )}
+                  <RefreshCw className={`w-3.5 h-3.5 ${engineHealthLoading ? "animate-spin" : ""}`} /> Refresh
                 </button>
               </div>
 
               {!engineHealth && !engineHealthLoading && (
                 <div className="flex flex-col items-center justify-center py-16 text-gray-500 gap-3">
                   <span className="text-4xl">🔧</span>
-                  <p className="text-sm">Click <span className="text-sky-400 font-semibold">Run Health Check</span> to query the backend engine.</p>
+                  <p className="text-sm">Loading engine health… or click <span className="text-sky-400 font-semibold">Refresh</span>.</p>
                 </div>
               )}
 
@@ -2521,7 +2730,7 @@ export default function Dashboard() {
                       </div>
                       {h.process && (
                         <div className="bg-black/20 border border-white/5 rounded-xl p-4 space-y-2">
-                          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Process</div>
+                          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">API Process</div>
                           <div className="text-[11px] text-gray-300 space-y-1 font-mono">
                             <div>PID: <span className="text-white">{h.process.pid}</span></div>
                             <div>Status: <span className={h.process.status === "running" ? "text-green-400" : "text-yellow-400"}>{h.process.status}</span></div>
@@ -2530,6 +2739,150 @@ export default function Dashboard() {
                           </div>
                         </div>
                       )}
+                    </div>
+                    {/* All subprocesses that make up this deployment (backend + frontend) */}
+                    {Array.isArray(h.subprocesses) && h.subprocesses.length > 0 && (
+                      <div className="bg-black/20 border border-white/5 rounded-xl p-4 space-y-3">
+                        <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                          Subprocesses ({h.subprocesses.length})
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          {h.subprocesses.map((sp: any) => {
+                            const healthy = sp.status === "running" || sp.status === "sleeping";
+                            const up = sp.uptime_seconds || 0;
+                            return (
+                              <div key={sp.pid} className="bg-black/20 border border-white/5 rounded-lg p-3 space-y-1.5">
+                                <div className="flex items-center gap-2">
+                                  <span className={`w-2 h-2 rounded-full flex-shrink-0 ${healthy ? "bg-green-400 animate-pulse" : "bg-yellow-400"}`} />
+                                  <span className="font-bold text-sm text-white">{sp.role}</span>
+                                </div>
+                                <div className="text-[11px] text-gray-300 font-mono grid grid-cols-2 gap-x-3 gap-y-0.5">
+                                  <div>PID: <span className="text-white">{sp.pid}</span></div>
+                                  <div>Status: <span className={healthy ? "text-green-400" : "text-yellow-400"}>{sp.status}</span></div>
+                                  <div>RAM: <span className="text-cyan-400">{sp.mem_mb} MB</span></div>
+                                  <div>Threads: <span className="text-violet-400">{sp.threads}</span></div>
+                                  <div className="col-span-2">Uptime: <span className="text-sky-400">{Math.floor(up / 3600)}h {Math.floor((up % 3600) / 60)}m</span></div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+            </div>
+            )}
+
+            {/* Section: Resource Usage (CPU/mem/disk history) */}
+            {activeSettingsSection === "resource" && (
+            <div className="p-6 space-y-5">
+              <div className="flex items-center justify-between gap-4 border-b border-white/10 pb-4">
+                <div>
+                  <h2 className="text-xl font-bold text-white flex items-center gap-2">📊 Resource Usage</h2>
+                  <p className="text-xs text-gray-400 mt-1">Vnotice processes (backend + frontend) — CPU%, memory (RSS) &amp; app data size, sampled hourly, kept 365 days</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  {[1, 7, 30, 90, 365].map((d) => (
+                    <button key={d} onClick={() => setUsageRange(d)}
+                      className={`px-2.5 py-1 text-[11px] font-bold rounded-md border transition ${usageRange === d ? "bg-sky-500/15 border-sky-400/30 text-sky-300" : "border-white/10 text-gray-400 hover:text-white hover:bg-white/5"}`}>
+                      {d === 365 ? "1y" : d + "d"}
+                    </button>
+                  ))}
+                  <button onClick={loadUsage} disabled={usageLoading}
+                    className="px-3 py-1.5 text-xs font-bold rounded-lg bg-sky-500/15 border border-sky-400/25 text-sky-300 hover:bg-sky-500/25 transition flex items-center gap-1.5 disabled:opacity-50">
+                    <RefreshCw className={`w-3.5 h-3.5 ${usageLoading ? "animate-spin" : ""}`} /> Refresh
+                  </button>
+                </div>
+              </div>
+              {(() => {
+                // Per-process hourly samples (new schema). Plot hourly so the line
+                // builds within hours, not days. Range = last N days of hours.
+                const rows = usageData
+                  .filter((s) => s && s.mem_mb !== undefined && s.t)
+                  .map((s) => ({ t: s.t as string, cpu: s.cpu_pct || 0, mem: s.mem_mb || 0, disk: s.disk_mb || 0 }))
+                  .sort((a, b) => a.t.localeCompare(b.t));
+                const shown = rows.slice(-usageRange * 24);
+
+                if (usageLoading && shown.length === 0) {
+                  return <div className="text-center py-16 text-gray-500 text-sm">Loading usage history…</div>;
+                }
+                if (shown.length === 0) {
+                  return (
+                    <div className="text-center py-16 text-gray-500 text-sm">
+                      <p className="font-semibold">No samples recorded yet.</p>
+                      <p className="mt-1 text-xs">The backend records one sample per hour. Check back after it has been running at least an hour.</p>
+                    </div>
+                  );
+                }
+
+                const W = 760, H = 200;
+                const xAt = (i: number) => (shown.length <= 1 ? W / 2 : (i / (shown.length - 1)) * W);
+                const metrics = [
+                  { key: "cpu" as const,  label: "CPU",         color: "#38bdf8", fmt: (v: number) => v.toFixed(1) + "%" },
+                  { key: "mem" as const,  label: "Memory (RSS)", color: "#a78bfa", fmt: (v: number) => v.toFixed(0) + " MB" },
+                  { key: "disk" as const, label: "Data on disk", color: "#34d399", fmt: (v: number) => v.toFixed(1) + " MB" },
+                ];
+                // Each line is normalised to its own peak so trends are comparable despite different units.
+                const peakOf = (key: "cpu" | "mem" | "disk") => Math.max(1e-6, ...shown.map((d) => d[key]));
+                const yAt = (key: "cpu" | "mem" | "disk", v: number) => H - (v / (peakOf(key) * 1.1)) * H;
+                const stat = (key: "cpu" | "mem" | "disk") => {
+                  const vals = shown.map((d) => d[key]);
+                  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+                  return { latest: vals[vals.length - 1], avg, peak: Math.max(...vals) };
+                };
+                const procs = usageData.length ? (usageData[usageData.length - 1].procs ?? "—") : "—";
+
+                return (
+                  <div className="space-y-5">
+                    <div className="grid grid-cols-3 gap-3">
+                      {metrics.map((m) => {
+                        const s = stat(m.key);
+                        return (
+                          <div key={m.key} className="bg-black/20 border border-white/5 rounded-xl p-4 space-y-1">
+                            <div className="flex items-center gap-2">
+                              <span className="w-2.5 h-2.5 rounded-full" style={{ background: m.color }} />
+                              <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{m.label}</span>
+                            </div>
+                            <div className="text-2xl font-black" style={{ color: m.color }}>{m.fmt(s.latest)}</div>
+                            <div className="text-[11px] text-gray-500">avg {m.fmt(s.avg)} · peak {m.fmt(s.peak)}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className="bg-black/20 border border-white/5 rounded-xl p-4">
+                      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="w-full h-52">
+                        {[0, 25, 50, 75, 100].map((g) => (
+                          <line key={g} x1={0} x2={W} y1={H - (g / 100) * H} y2={H - (g / 100) * H} stroke="rgba(255,255,255,0.07)" strokeWidth="1" vectorEffect="non-scaling-stroke" />
+                        ))}
+                        {metrics.map((m) => (
+                          <polyline key={m.key} fill="none" stroke={m.color} strokeWidth="2" vectorEffect="non-scaling-stroke"
+                            points={shown.map((d, i) => `${xAt(i)},${yAt(m.key, d[m.key])}`).join(" ")} />
+                        ))}
+                        {/* Dots so sparse data (even a single sample) is visible; skip on dense ranges. */}
+                        {shown.length <= 200 && metrics.map((m) => (
+                          <g key={m.key + "-pts"}>
+                            {shown.map((d, i) => (
+                              <circle key={i} cx={xAt(i)} cy={yAt(m.key, d[m.key])} r={shown.length <= 1 ? 4 : 2.5} fill={m.color} />
+                            ))}
+                          </g>
+                        ))}
+                      </svg>
+                      <div className="flex items-center justify-between mt-2">
+                        <div className="flex items-center gap-4">
+                          {metrics.map((m) => (
+                            <span key={m.key} className="flex items-center gap-1.5 text-[11px] text-gray-400">
+                              <span className="w-3 h-0.5 rounded-full" style={{ background: m.color }} />{m.label}
+                            </span>
+                          ))}
+                        </div>
+                        <span className="text-[10px] text-gray-600 font-mono">
+                          {shown[0].t.slice(5, 16).replace("T", " ")} → {shown[shown.length - 1].t.slice(5, 16).replace("T", " ")} · {shown.length} pts · {procs} procs
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-gray-600 mt-1.5">Each line is scaled to its own peak (different units) — read exact values from the cards above. Watch the Memory line over time to spot leaks.</p>
                     </div>
                   </div>
                 );
@@ -2640,6 +2993,12 @@ export default function Dashboard() {
                           <span className="text-[9px] bg-sky-500/10 border border-sky-400/20 text-sky-300 px-1.5 py-0.5 rounded font-semibold" title="CVEs currently loaded that match this rule">
                             ⌖ {countRuleMatches(rule)} match{countRuleMatches(rule) !== 1 ? "es" : ""}
                           </span>
+                          <span
+                            className={`text-[9px] px-1.5 py-0.5 rounded font-semibold border ${rule.lastSentAt ? "bg-emerald-500/10 border-emerald-400/20 text-emerald-300" : "bg-white/5 border-white/10 text-gray-500"}`}
+                            title="How many emails this alert has sent, and when it last sent"
+                          >
+                            ✉ {rule.sentCount ? `${rule.sentCount} sent · last ${new Date(rule.lastSentAt!).toLocaleString()}` : "never sent"}
+                          </span>
                           <span className="text-[9px] text-gray-600 px-1.5 py-0.5">
                             {new Date(rule.createdAt).toLocaleDateString()}
                           </span>
@@ -2666,6 +3025,22 @@ export default function Dashboard() {
                           />
                           <div className="w-9 h-5 bg-black border border-white/20 peer-focus:outline-none rounded-full peer transition-colors peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:shadow-sm after:border-none after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-emerald-500 peer-checked:border-emerald-500 peer-checked:shadow-[0_0_8px_rgba(16,185,129,0.45)]"></div>
                         </label>
+                        <button
+                          type="button"
+                          onClick={() => handleApplyAlertFilter(rule)}
+                          className="p-1.5 text-gray-400 hover:text-sky-400 hover:bg-white/5 rounded transition"
+                          title="Apply this alert's filter to the Threat Stream to see matching CVEs"
+                        >
+                          <Search className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => sendAlertTestEmail(rule)}
+                          className="p-1.5 text-gray-400 hover:text-emerald-400 hover:bg-white/5 rounded transition"
+                          title="Email the latest CVE matching this alert to your configured recipient now"
+                        >
+                          <Mail className="w-3.5 h-3.5" />
+                        </button>
                         <button
                           type="button"
                           onClick={() => {
@@ -2819,7 +3194,11 @@ export default function Dashboard() {
                     <div className="glass-panel p-5 rounded-xl border border-white/5 shadow-lg flex flex-col justify-center">
                       <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider">Avg EPSS Rate</span>
                       <span className="text-3xl font-black text-green-400 mt-1.5">
-                        {((vulnerabilities.reduce((acc, curr) => acc + curr.epss, 0) / (vulnerabilities.length || 1)) * 100).toFixed(1)}%
+                        {(() => {
+                          const known = vulnerabilities.filter((v) => v.epss != null);
+                          const avg = known.length ? known.reduce((a, c) => a + c.epss, 0) / known.length : 0;
+                          return (avg * 100).toFixed(1);
+                        })()}%
                       </span>
                     </div>
                   </div>

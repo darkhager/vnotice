@@ -1,0 +1,11 @@
+[Unit]
+Description=Vnotice scheduled feed sync (runs the real /sync/ pipeline)
+After=vnotice-backend.service
+Wants=vnotice-backend.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/vnotice/vnotice/backend
+ExecStart=/home/vnotice/vnotice/backend/venv_server/bin/python /home/vnotice/vnotice/backend/auto_sync.py
+StandardOutput=append:/home/vnotice/autosync.log
+StandardError=append:/home/vnotice/autosync.log

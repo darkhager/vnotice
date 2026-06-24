@@ -4,6 +4,24 @@ from sqlalchemy.types import CHAR, TypeDecorator
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import relationship
 from database import Base
+import crypto
+
+
+class EncryptedText(TypeDecorator):
+    """Transparently encrypts a secret on write and decrypts it on read.
+
+    Stored as TEXT (ciphertext), so no schema/migration change is needed when an
+    existing plaintext column is switched to this type — legacy values pass
+    through crypto.decrypt() unchanged and get encrypted on their next save.
+    """
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return crypto.encrypt(value)
+
+    def process_result_value(self, value, dialect):
+        return crypto.decrypt(value)
 
 
 class GUID(TypeDecorator):
@@ -63,6 +81,7 @@ class CVE(Base):
     product = Column(String(100))
     reference_url = Column(Text)
     rss_source = Column(String(100))
+    keywords = Column(JSON, default=list)   # extracted keywords/product terms for this CVE
     created_at = Column(DateTime(timezone=True), server_default=text('CURRENT_TIMESTAMP'))
 
     __table_args__ = (
@@ -90,18 +109,19 @@ class UserConfig(Base):
     notify_teams = Column(Boolean, default=False)
 
     # Notification Channel Targets
-    discord_webhook = Column(Text, nullable=True)
-    telegram_bot_token = Column(Text, nullable=True)
+    # Secret-bearing columns are encrypted at rest via EncryptedText.
+    discord_webhook = Column(EncryptedText, nullable=True)
+    telegram_bot_token = Column(EncryptedText, nullable=True)
     telegram_chat_id = Column(String(100), nullable=True)
-    slack_webhook = Column(Text, nullable=True)
-    teams_webhook = Column(Text, nullable=True)
+    slack_webhook = Column(EncryptedText, nullable=True)
+    teams_webhook = Column(EncryptedText, nullable=True)
     smtp_host = Column(String(255), nullable=True)
     smtp_port = Column(Integer, default=587)
     smtp_username = Column(String(255), nullable=True)
-    smtp_password = Column(Text, nullable=True)
+    smtp_password = Column(EncryptedText, nullable=True)
     smtp_to_address = Column(String(255), nullable=True)
     sms_twilio_sid = Column(String(100), nullable=True)
-    sms_twilio_token = Column(Text, nullable=True)
+    sms_twilio_token = Column(EncryptedText, nullable=True)
     sms_from_number = Column(String(20), nullable=True)
     sms_to_number = Column(String(20), nullable=True)
 

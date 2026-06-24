@@ -10,7 +10,7 @@ interface CveItem {
   product: string;
   severity: string;
   score: number;
-  epss: number;
+  epss: number | null;
   date: string;
   url: string;
   source?: string;
@@ -44,6 +44,7 @@ const BASE_WIDTHS: Record<ColKey, number> = {
 
 const LS_ORDER  = "vnotice_col_order";
 const LS_HIDDEN = "vnotice_col_hidden";
+const LS_WIDTHS = "vnotice_col_widths";
 
 function loadLS<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
@@ -77,11 +78,16 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
   }, [vulnerabilities]);
 
   const scale = ({ sm: 0.9, md: 1.0, lg: 1.15, xl: 1.35, "2xl": 1.55 } as Record<string, number>)[textSize] ?? 1.0;
-  const [widths, setWidths] = useState<Record<ColKey, number>>(() =>
-    Object.fromEntries(ALL_COLUMNS.map(k => [k, Math.round(BASE_WIDTHS[k] * scale)])) as Record<ColKey, number>
-  );
+  const scaledWidths = () =>
+    Object.fromEntries(ALL_COLUMNS.map(k => [k, Math.round(BASE_WIDTHS[k] * scale)])) as Record<ColKey, number>;
+  const [widths, setWidths] = useState<Record<ColKey, number>>(() => {
+    const saved = loadLS<Record<ColKey, number> | null>(LS_WIDTHS, null);
+    return saved && ALL_COLUMNS.every(k => typeof saved[k] === "number") ? saved : scaledWidths();
+  });
   useEffect(() => {
-    setWidths(Object.fromEntries(ALL_COLUMNS.map(k => [k, Math.round(BASE_WIDTHS[k] * scale)])) as Record<ColKey, number>);
+    // Text-size rescaling only applies until the user manually resizes (saved widths win).
+    if (loadLS<Record<ColKey, number> | null>(LS_WIDTHS, null)) return;
+    setWidths(scaledWidths());
   }, [textSize]);
 
   // Column resize
@@ -93,9 +99,16 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
     resizingCol.current = col; startX.current = e.clientX; startW.current = widths[col];
     const onMove = (ev: MouseEvent) => {
       if (!resizingCol.current) return;
-      setWidths(prev => ({ ...prev, [resizingCol.current!]: Math.max(80, startW.current + ev.clientX - startX.current) }));
+      // Min 24px so a column can be shrunk down to a sliver (text clipped) if wanted.
+      setWidths(prev => ({ ...prev, [resizingCol.current!]: Math.max(24, startW.current + ev.clientX - startX.current) }));
     };
-    const onUp = () => { resizingCol.current = null; document.removeEventListener("mousemove", onMove); document.removeEventListener("mouseup", onUp); };
+    const onUp = () => {
+      resizingCol.current = null;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      // Persist the adjusted widths so they survive reloads.
+      setWidths(prev => { localStorage.setItem(LS_WIDTHS, JSON.stringify(prev)); return prev; });
+    };
     document.addEventListener("mousemove", onMove); document.addEventListener("mouseup", onUp);
   };
 
@@ -153,7 +166,7 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
     switch (col) {
       case "cve":
         return (
-          <td key={col} className="py-3 px-4 text-[0.85em] align-top" style={{ width: widths.cve, minWidth: widths.cve }}>
+          <td key={col} className="py-3 px-4 text-[0.85em] align-top overflow-hidden" style={{ width: widths.cve, minWidth: widths.cve }}>
             {/* Line 1: CVE ID + copy */}
             <button onClick={(e) => copyId(cve.id, e)} title="Copy CVE ID"
               className="font-mono font-bold text-sky-400 hover:text-sky-300 flex items-center gap-1 group/copy">
@@ -177,14 +190,14 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
         );
       case "product":
         return (
-          <td key={col} className="py-3 px-4 text-[0.85em] align-top" style={{ width: widths.product, minWidth: widths.product }}>
+          <td key={col} className="py-3 px-4 text-[0.85em] align-top overflow-hidden" style={{ width: widths.product, minWidth: widths.product }}>
             <span className="font-semibold text-cyan-400 truncate block" title={cve.vendor}>{cve.vendor}</span>
             <div className="text-[0.8em] text-gray-500 mt-0.5 truncate" title={cve.product}>{cve.product}</div>
           </td>
         );
       case "severity":
         return (
-          <td key={col} className="py-3 px-4 text-[0.85em] align-top" style={{ width: widths.severity, minWidth: widths.severity }}>
+          <td key={col} className="py-3 px-4 text-[0.85em] align-top overflow-hidden" style={{ width: widths.severity, minWidth: widths.severity }}>
             <span className={`px-2 py-0.5 text-[0.75em] font-extrabold rounded-md uppercase tracking-wider ${severityColor(cve.severity)}`}>
               {cve.severity}
             </span>
@@ -192,7 +205,7 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
         );
       case "scores":
         return (
-          <td key={col} className="py-3 px-4 text-[0.85em] align-top" style={{ width: widths.scores, minWidth: widths.scores }}>
+          <td key={col} className="py-3 px-4 text-[0.85em] align-top overflow-hidden" style={{ width: widths.scores, minWidth: widths.scores }}>
             <div className="flex items-center gap-2 mb-1">
               <span className="font-bold font-mono text-orange-400 min-w-[2.2em]">{cve.score?.toFixed(1) ?? "—"}</span>
               <div className="w-[5em] h-[0.3em] bg-white/10 rounded-full overflow-hidden flex-shrink-0">
@@ -201,13 +214,13 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
               </div>
             </div>
             <div className="text-[0.75em] text-gray-500 font-mono">
-              EPSS: <span className="text-green-400 font-bold">{((cve.epss ?? 0) * 100).toFixed(2)}%</span>
+              EPSS: <span className="text-green-400 font-bold">{cve.epss == null ? "N/A" : (cve.epss * 100).toFixed(2) + "%"}</span>
             </div>
           </td>
         );
       case "date":
         return (
-          <td key={col} className="py-3 px-4 text-[0.85em] align-top font-semibold text-gray-400 font-mono"
+          <td key={col} className="py-3 px-4 text-[0.85em] align-top overflow-hidden font-semibold text-gray-400 font-mono"
             style={{ width: widths.date, minWidth: widths.date }}>
             {cve.date}
           </td>
@@ -216,7 +229,7 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
         // Stored UTC ISO string → show "YYYY-MM-DD HH:MM" as-is (no tz shift).
         const ts = cve.ingestedAt ? cve.ingestedAt.replace("T", " ").slice(0, 16) : "";
         return (
-          <td key={col} className="py-3 px-4 text-[0.85em] align-top font-mono text-gray-400"
+          <td key={col} className="py-3 px-4 text-[0.85em] align-top overflow-hidden font-mono text-gray-400"
             style={{ width: widths.ingested, minWidth: widths.ingested }}>
             {ts
               ? <span title={cve.ingestedAt}>{ts}</span>
@@ -226,7 +239,7 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
       }
       case "source":
         return (
-          <td key={col} className="py-3 px-4 text-[0.85em] align-top" style={{ width: widths.source, minWidth: widths.source }}>
+          <td key={col} className="py-3 px-4 text-[0.85em] align-top overflow-hidden" style={{ width: widths.source, minWidth: widths.source }}>
             {cve.source ? (
               <span className="inline-flex items-center px-2 py-0.5 rounded text-[0.72em] font-medium bg-violet-500/10 text-violet-400 border border-violet-500/20 max-w-full truncate" title={cve.source}>
                 {cve.source}
@@ -238,6 +251,10 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
         );
     }
   };
+
+  // table-fixed + explicit total width => columns honor their set width and clip,
+  // so a column can be dragged narrow enough to hide part of the text.
+  const totalWidth = visibleCols.reduce((s, c) => s + (widths[c] || 0), 0);
 
   return (
     <div className="glass-panel overflow-hidden border border-white/5 shadow-2xl rounded-2xl flex flex-col w-full relative h-full">
@@ -257,11 +274,11 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
       )}
 
       <div className="overflow-x-auto w-full flex-1 min-h-0">
-        <table className="w-full text-left border-collapse select-text">
+        <table className="text-left border-collapse select-text" style={{ tableLayout: "fixed", width: totalWidth || "100%" }}>
           <thead>
             <tr className="bg-black/30 border-b border-white/10 text-[0.7em] uppercase font-bold tracking-widest text-gray-400 select-none">
               {visibleCols.map((col) => (
-                <th key={col} className="relative" style={{ width: widths[col], minWidth: widths[col] }}>
+                <th key={col} className="relative overflow-hidden" style={{ width: widths[col], minWidth: widths[col], maxWidth: widths[col] }}>
                   <div className="px-4 py-3">
                     <span className="truncate">{COLUMN_LABELS[col]}</span>
                   </div>

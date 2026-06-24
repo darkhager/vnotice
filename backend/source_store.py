@@ -26,6 +26,7 @@ STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "so
 _FIELDS = (
     "cve_id", "title", "description", "severity", "cvss_score", "epss",
     "published_date", "updated_date", "vendor", "product", "reference_url",
+    "keywords",
 )
 
 
@@ -148,4 +149,5 @@ def record_to_cve_kwargs(rec: dict) -> dict:
         "product": rec.get("product"),
         "reference_url": rec.get("reference_url"),
         "rss_source": rec.get("rss_source"),
+        "keywords": rec.get("keywords") or [],
     }

@@ -10,6 +10,23 @@ import json
 
 logger = logging.getLogger(__name__)
 
+# Common English + advisory-boilerplate words that carry no signal as keywords.
+_KW_STOPWORDS = {
+    "the", "and", "for", "with", "via", "that", "this", "from", "are", "was", "were",
+    "could", "would", "may", "can", "has", "have", "had", "not", "but", "all", "any",
+    "into", "out", "due", "per", "use", "used", "using", "when", "which", "who", "how",
+    "vulnerability", "vulnerabilities", "vuln", "security", "update", "updates", "advisory",
+    "advisories", "issue", "issues", "flaw", "flaws", "fix", "fixed", "fixes", "patch",
+    "attacker", "attackers", "remote", "local", "allow", "allows", "allowed", "execute",
+    "execution", "arbitrary", "code", "affected", "product", "products", "package",
+    "packages", "version", "versions", "release", "available", "multiple", "related",
+    "information", "details", "impact", "score", "scoring", "vector", "cvss", "cwe",
+    "severity", "important", "critical", "moderate", "high", "low", "medium", "none",
+    "enterprise", "system", "systems", "server", "client", "application", "service",
+    "vulnerable", "exploit", "exploitation", "unauthenticated", "authenticated",
+}
+
+
 def parse_date(date_str: str):
     if not date_str:
         return datetime.utcnow()
@@ -19,6 +36,7 @@ def parse_date(date_str: str):
         '%a, %d %b %Y %H:%M:%S %z',
         '%a, %d %b %Y %H:%M:%S',
         '%Y-%m-%dT%H:%M:%S.%fZ',     # ISO with millis + Z (e.g. Palo Alto: 2026-06-13T01:45:00.000Z)
+        '%Y-%m-%dT%H:%M:%S.%f%z',    # ISO with millis + offset (e.g. Rocky: ...155864+00:00)
         '%Y-%m-%dT%H:%M:%S.%f',
         '%Y-%m-%dT%H:%M:%S%z',
         '%Y-%m-%dT%H:%M:%SZ',
@@ -297,11 +315,16 @@ class RSSIngestionService:
         items = []
         rows = re.split(r'<tr class="advisory-tr">', html)[1:]
         for row in rows:
-            cve_match = re.search(r"CVE-\d{4}-\d+", _cell(row, "CVE"))
-            if not cve_match:
-                continue
-            cve_id = cve_match.group(0)
             svd = _cell(row, "SVD")
+            cve_match = re.search(r"CVE-\d{4}-\d+", _cell(row, "CVE"))
+            if cve_match:
+                cve_id = cve_match.group(0)
+            elif svd.startswith("SVD-"):
+                # Some Splunk advisories (often third-party bundles) carry no parseable
+                # CVE in the table — fall back to the SVD id so they're still tracked.
+                cve_id = svd
+            else:
+                continue
             title = _cell(row, "Title") or f"Splunk advisory {svd}"
 
             severity = (_cell(row, "Severity") or "Medium").capitalize()
@@ -348,7 +371,7 @@ class RSSIngestionService:
                 "description":    description,
                 "severity":       severity,
                 "cvss_score":     cvss_score,
-                "epss":           round(random.uniform(0.01, 0.30), 4),
+                "epss":           None,   # filled with real EPSS on sync; SVD ids stay N/A
                 "vendor":         "Splunk",
                 "product":        product[:100],
                 "reference_url":  ref_url,
@@ -525,6 +548,246 @@ class RSSIngestionService:
         return items
 
     @staticmethod
+    def extract_keywords(title: str = "", description: str = "",
+                         vendor: str = "", product: str = "", max_keywords: int = 12) -> list:
+        """Extract searchable keywords from a CVE's text + product name.
+
+        The product and vendor names are always included first (the "product name"
+        requirement); the remaining slots are filled with the most frequent
+        meaningful tokens from the title/description (stopwords, short tokens and
+        bare numbers removed). Used to build the per-CVE keyword store on ingest.
+        """
+        keywords = []
+
+        def _add(term):
+            t = (term or "").strip().lower()
+            if t and t not in ("various", "unknown", "unknown product", "n/a") and t not in keywords:
+                keywords.append(t)
+
+        _add(product)
+        _add(vendor)
+
+        text = f"{title} {description}".lower()
+        freq = {}
+        for tok in re.findall(r"[a-z][a-z0-9+.\-_]{2,}", text):
+            tok = tok.strip(".-_")
+            if len(tok) < 3 or tok.isdigit() or tok in _KW_STOPWORDS:
+                continue
+            freq[tok] = freq.get(tok, 0) + 1
+
+        for tok in sorted(freq, key=lambda k: (-freq[k], k)):
+            if tok not in keywords:
+                keywords.append(tok)
+            if len(keywords) >= max_keywords:
+                break
+        return keywords[:max_keywords]
+
+    @staticmethod
+    def _map_vendor_severity(raw: str) -> str:
+        """Normalize vendor severity words (Red Hat / Rocky / Microsoft) to our scale."""
+        return {
+            "critical": "Critical",
+            "important": "High",
+            "high": "High",
+            "moderate": "Medium",
+            "medium": "Medium",
+            "low": "Low",
+            "informational": "Informational",
+            "none": "Low",
+        }.get((raw or "").strip().lower(), "Medium")
+
+    @staticmethod
+    def fetch_redhat_advisories(max_advisories: int = 60):
+        """Fetch RHEL CVEs from the Red Hat Security Data API (JSON) with real CVSS/severity."""
+        url = f"https://access.redhat.com/hydra/rest/securitydata/cve.json?per_page={max_advisories}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                   "Accept": "application/json"}
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except Exception as e:
+            logger.error(f"Error fetching Red Hat advisories: {e}")
+            return []
+        if not isinstance(data, list):
+            return []
+
+        items = []
+        for rec in data:
+            cve_id = str(rec.get("CVE") or "").strip()
+            if not cve_id.startswith("CVE-"):
+                continue
+            severity = RSSIngestionService._map_vendor_severity(rec.get("severity"))
+            try:
+                cvss_score = float(rec.get("cvss3_score") or rec.get("cvss_score") or 0) or 5.0
+            except (TypeError, ValueError):
+                cvss_score = 5.0
+            title = (rec.get("bugzilla_description") or f"Red Hat advisory for {cve_id}").strip()
+            pkgs = [str(p) for p in (rec.get("affected_packages") or [])]
+            product = "Red Hat Enterprise Linux"
+            if pkgs:
+                product = re.split(r"[-:]\d", pkgs[0])[0].strip() or product
+            desc_parts = [title.rstrip(".") + "."]
+            if rec.get("CWE"):
+                desc_parts.append(str(rec["CWE"]) + ".")
+            if pkgs:
+                desc_parts.append("Affected packages: " + ", ".join(pkgs[:6]) + ".")
+            items.append({
+                "cve_id":         cve_id,
+                "title":          title[:200],
+                "description":    " ".join(desc_parts),
+                "severity":       severity,
+                "cvss_score":     cvss_score,
+                "epss":           None,
+                "vendor":         "Red Hat",
+                "product":        product[:100],
+                "reference_url":  rec.get("resource_url") or f"https://access.redhat.com/security/cve/{cve_id.lower()}",
+                "published_date": parse_date(rec.get("public_date") or ""),
+            })
+            if len(items) >= max_advisories:
+                break
+        logger.info(f"Red Hat advisories: parsed {len(items)} CVEs")
+        return items
+
+    @staticmethod
+    def fetch_rocky_advisories(max_advisories: int = 60):
+        """Fetch Rocky Linux security advisories (RLSA) from the RESF Apollo API (JSON).
+
+        Paged in small chunks: the API's larger responses (size>~10) can truncate
+        mid-stream (urllib IncompleteRead) over some networks, so we request small
+        pages and accumulate until we have enough.
+        """
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                   "Accept": "application/json"}
+        items = []
+        page, page_size = 1, 10
+        while len(items) < max_advisories and page <= 12:
+            url = f"https://apollo.build.resf.org/api/v3/advisories/?page={page}&size={page_size}"
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            except Exception as e:
+                logger.error(f"Error fetching Rocky Linux advisories (page {page}): {e}")
+                break
+            advisories = data.get("advisories", []) if isinstance(data, dict) else []
+            if not advisories:
+                break
+            for adv in advisories:
+                severity = RSSIngestionService._map_vendor_severity(adv.get("severity"))
+                name = adv.get("name") or ""
+                synopsis = (adv.get("synopsis") or name or "Rocky Linux security update").strip()
+                published_date = parse_date(adv.get("published_at") or "")
+                prods = adv.get("affected_products") or []
+                product = "Rocky Linux"
+                if prods and isinstance(prods[0], dict):
+                    product = prods[0].get("name") or product
+                ref = f"https://errata.rockylinux.org/{name}" if name else "https://errata.rockylinux.org/"
+                desc = (adv.get("description") or synopsis).strip()[:1000]
+                for c in adv.get("cves") or []:
+                    cve_id = str(c.get("cve") or "").strip()
+                    if not cve_id.startswith("CVE-"):
+                        continue
+                    try:
+                        cvss_score = float(c.get("cvss3_base_score") or 0) or 5.0
+                    except (TypeError, ValueError):
+                        cvss_score = 5.0
+                    items.append({
+                        "cve_id":         cve_id,
+                        "title":          (f"{name}: {synopsis}" if name else synopsis)[:200],
+                        "description":    desc,
+                        "severity":       severity,
+                        "cvss_score":     cvss_score,
+                        "epss":           None,
+                        "vendor":         "Rocky Linux",
+                        "product":        str(product)[:100],
+                        "reference_url":  ref,
+                        "published_date": published_date,
+                    })
+                    if len(items) >= max_advisories:
+                        break
+                if len(items) >= max_advisories:
+                    break
+            page += 1
+        logger.info(f"Rocky Linux advisories: parsed {len(items)} CVEs")
+        return items
+
+    @staticmethod
+    def fetch_microsoft_advisories(max_advisories: int = 80):
+        """Fetch Microsoft/Windows CVEs from the MSRC CVRF API (JSON).
+
+        Picks the most recent monthly security-update document (trying the current
+        month then falling back), and parses each vulnerability's real CVE id,
+        title, severity (Threat Type 3) and CVSS base score.
+        """
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                   "Accept": "application/json"}
+        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        now = datetime.utcnow()
+        doc = None
+        for back in range(0, 4):
+            m, y = now.month - back, now.year
+            while m <= 0:
+                m += 12
+                y -= 1
+            month_id = f"{y}-{months[m - 1]}"
+            try:
+                req = urllib.request.Request(
+                    f"https://api.msrc.microsoft.com/cvrf/v3.0/cvrf/{month_id}", headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    doc = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                break
+            except Exception:
+                continue
+        if not doc:
+            logger.error("Error fetching Microsoft advisories: no monthly document resolved")
+            return []
+
+        items = []
+        for v in doc.get("Vulnerability", []):
+            cve_id = str(v.get("CVE") or "").strip()
+            if not cve_id.startswith("CVE-"):
+                continue
+            title = ((v.get("Title") or {}).get("Value") or f"Microsoft advisory {cve_id}").strip()
+            severity = "Medium"
+            for t in v.get("Threats", []):
+                if t.get("Type") == 3:
+                    severity = RSSIngestionService._map_vendor_severity((t.get("Description") or {}).get("Value"))
+                    break
+            cvss_score = 5.0
+            for s in v.get("CVSSScoreSets", []):
+                if s.get("BaseScore") is not None:
+                    try:
+                        cvss_score = float(s["BaseScore"])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            tl = title.lower()
+            product = ("Windows" if "windows" in tl else
+                       "Microsoft Office" if "office" in tl else
+                       "Microsoft Edge" if "edge" in tl else
+                       "Microsoft SQL Server" if "sql server" in tl else
+                       "Microsoft SharePoint" if "sharepoint" in tl else
+                       "Microsoft")
+            items.append({
+                "cve_id":         cve_id,
+                "title":          title[:200],
+                "description":    title,
+                "severity":       severity,
+                "cvss_score":     cvss_score,
+                "epss":           None,
+                "vendor":         "Microsoft",
+                "product":        product,
+                "reference_url":  f"https://msrc.microsoft.com/update-guide/vulnerability/{cve_id}",
+                "published_date": now,
+            })
+            if len(items) >= max_advisories:
+                break
+        logger.info(f"Microsoft advisories: parsed {len(items)} CVEs")
+        return items
+
+    @staticmethod
     def fetch_real_epss_score(cve_id: str) -> float:
         """Query FIRST.org EPSS API to get the real EPSS score for a CVE."""
         try:
@@ -539,6 +802,37 @@ class RSSIngestionService:
         except Exception as e:
             logger.error(f"Error fetching EPSS from FIRST API for {cve_id}: {e}")
         return 0.0
+
+    @staticmethod
+    def fetch_epss_batch(cve_ids) -> dict:
+        """Fetch REAL EPSS scores from FIRST.org for many CVEs at once.
+
+        Uses the batch endpoint (api.first.org/data/v1/epss?cve=CVE-1,CVE-2,...),
+        chunked to 100 per request. Returns {cve_id: epss_float} for the CVEs the
+        API actually knows; any CVE missing from the result has no EPSS yet and the
+        caller should show N/A (store None) rather than inventing a value.
+        """
+        import json
+        out: dict = {}
+        ids = sorted({c.strip().upper() for c in cve_ids
+                      if c and str(c).strip().upper().startswith("CVE-")})
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            url = "https://api.first.org/data/v1/epss?cve=" + ",".join(chunk) + "&limit=100"
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                if data.get("status") == "OK":
+                    for row in data.get("data", []):
+                        cid = (row.get("cve") or "").upper()
+                        try:
+                            out[cid] = round(float(row.get("epss", 0.0)), 6)
+                        except (TypeError, ValueError):
+                            pass
+            except Exception as e:
+                logger.error(f"EPSS batch fetch failed (chunk @ {chunk[0]}): {e}")
+        return out
 
     @staticmethod
     def generate_cve_details_for_id(cve_id: str, source_name: str, source_url: str):
