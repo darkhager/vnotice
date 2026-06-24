@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Query, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, status, Query, BackgroundTasks, Body
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -655,6 +655,29 @@ def list_keywords(
         return {"total": 0, "keywords": []}
     top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
     return {"total": len(counts), "keywords": [{"keyword": k, "count": c} for k, c in top]}
+
+
+@app.get("/appstate/{key}")
+def get_app_state(key: str, db: Session = Depends(get_db)):
+    """Return a stored frontend state bundle (e.g. the profiles/settings blob)."""
+    row = db.query(models.AppState).filter(models.AppState.key == key).first()
+    return {"key": key, "value": row.value if row else None}
+
+
+@app.api_route("/appstate/{key}", methods=["PUT", "POST"])
+def put_app_state(key: str, payload: dict = Body(...), db: Session = Depends(get_db)):
+    """Upsert a frontend state bundle. POST is supported so the browser can use
+    navigator.sendBeacon on tab close. Persisting profiles here keeps them in the
+    DB (shared across browsers, captured by backups)."""
+    value = payload.get("value") if isinstance(payload, dict) else payload
+    row = db.query(models.AppState).filter(models.AppState.key == key).first()
+    if row:
+        row.value = value
+        row.updated_at = datetime.utcnow()
+    else:
+        db.add(models.AppState(key=key, value=value))
+    db.commit()
+    return {"key": key, "ok": True}
 
 
 @app.get("/")

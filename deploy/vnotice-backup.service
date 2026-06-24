@@ -1,0 +1,9 @@
+[Unit]
+Description=Vnotice database + data backup (consistent SQLite snapshot)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/vnotice/vnotice/backend
+ExecStart=/home/vnotice/vnotice/backend/venv_server/bin/python /home/vnotice/vnotice/backend/backup_db.py
+StandardOutput=append:/home/vnotice/backup.log
+StandardError=append:/home/vnotice/backup.log

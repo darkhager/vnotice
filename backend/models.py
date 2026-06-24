@@ -140,6 +140,18 @@ class UserConfig(Base):
     user = relationship("User", back_populates="config")
 
 
+class AppState(Base):
+    """Server-side key/value store mirroring the frontend's profile + settings
+    bundle (the `vnotice_*` localStorage keys). Keeps profiles/settings in the
+    database so they survive a browser cache-clear and are captured by DB backups.
+    """
+    __tablename__ = "app_state"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(JSON)
+    updated_at = Column(DateTime(timezone=True), server_default=text('CURRENT_TIMESTAMP'))
+
+
 class NotificationTrigger(Base):
     __tablename__ = "notification_triggers"
 

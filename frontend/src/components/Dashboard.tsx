@@ -4,6 +4,7 @@ import ProfileSelection from "./ProfileSelection";
 import CveTable from "./CveTable";
 import { ShieldAlert, Sun, Moon, LogOut, Save, Trash2, RefreshCw, X, Mail, Search } from "lucide-react";
 import { getApiBase } from "../lib/api";
+import { pushState, pushBeacon } from "../lib/profileSync";
 
 interface UserProfile {
   id: string;
@@ -787,6 +788,15 @@ export default function Dashboard() {
     if (!activeProfileId) return;
     localStorage.setItem(alertRulesKey(activeProfileId), JSON.stringify(rules));
   };
+
+  // Persist the profile/settings bundle to the server so it survives a browser
+  // cache-clear and is captured by DB backups. Push every 15s if changed + on close.
+  useEffect(() => {
+    const id = setInterval(() => { void pushState(); }, 15000);
+    window.addEventListener("beforeunload", pushBeacon);
+    void pushState();   // seed the server from this browser's current state
+    return () => { clearInterval(id); window.removeEventListener("beforeunload", pushBeacon); };
+  }, []);
 
   useEffect(() => {
     if (activeProfile) {
