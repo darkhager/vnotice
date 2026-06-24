@@ -1,4 +1,4 @@
-const DEFAULT_PORT = "8000";
+const DEFAULT_PORT = "8080";
 
 /**
  * Returns the backend base URL derived from the current browser host.
