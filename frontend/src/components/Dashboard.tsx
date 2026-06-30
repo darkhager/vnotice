@@ -15,6 +15,7 @@ interface UserProfile {
   preferences: {
     theme: "dark" | "light";
     textSize: "sm" | "md" | "lg" | "xl" | "2xl";
+    timezone?: string;
     vulnerabilityMinSeverity: "low" | "medium" | "high" | "critical";
     emailAlertsEnabled: boolean;
     desktopAlertsEnabled: boolean;
@@ -533,6 +534,7 @@ export default function Dashboard() {
             preferences: {
               theme: "dark",
               textSize: "md",
+              timezone: "ICT",
               vulnerabilityMinSeverity: "medium",
               emailAlertsEnabled: false,
               desktopAlertsEnabled: true,
@@ -565,6 +567,7 @@ export default function Dashboard() {
           preferences: {
             theme: "dark",
             textSize: "md",
+            timezone: "ICT",
             vulnerabilityMinSeverity: "medium",
             emailAlertsEnabled: false,
             desktopAlertsEnabled: true,
@@ -714,7 +717,7 @@ export default function Dashboard() {
     // Sync from active database if online
     const fetchApiCves = async () => {
       try {
-        const res = await fetch(`${getApiBase()}/cves/?limit=500`);
+        const res = await fetch(`${getApiBase()}/cves/?limit=5000`);
         if (res.ok) {
           const apiData = await res.json();
           if (apiData && apiData.length > 0) {
@@ -802,7 +805,7 @@ export default function Dashboard() {
     if (activeProfile) {
       setDisplayName(activeProfile.name || "");
       setEmail(activeProfile.email || "");
-      setTimezone(activeProfile.preferences?.vulnerabilityMinSeverity || "ICT");
+      setTimezone(activeProfile.preferences?.timezone || "ICT");
       setTextSize((activeProfile.preferences?.textSize as any) || "md");
       // Email Alerts: optionally borrow the admin account's SMTP config.
       const borrow = activeProfile.preferences?.useAdminSmtp || false;
@@ -894,6 +897,7 @@ export default function Dashboard() {
       preferences: {
         theme: activeProfile.preferences.theme,
         textSize: textSize,
+        timezone: timezone,
         vulnerabilityMinSeverity: activeProfile.preferences.vulnerabilityMinSeverity,
         emailAlertsEnabled: emailAlertsEnabled,
         desktopAlertsEnabled: activeProfile.preferences.desktopAlertsEnabled,
@@ -980,7 +984,7 @@ export default function Dashboard() {
       const res = await fetch(`${getApiBase()}/cves/refresh-epss`, { method: "POST" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const r = await res.json();
-      const cvesRes = await fetch(`${getApiBase()}/cves/?limit=500`);
+      const cvesRes = await fetch(`${getApiBase()}/cves/?limit=5000`);
       if (cvesRes.ok) {
         const apiData = await cvesRes.json();
         const mapped = apiData.map((c: any) => {
@@ -1032,7 +1036,7 @@ export default function Dashboard() {
         appendLog(`[OK] Discovered and parsed ${result.new_cves_added} new vulnerability records.`);
         
         // Refetch all CVEs from backend to update Threat Stream!
-        const cvesRes = await fetch(`${getApiBase()}/cves/?limit=500`);
+        const cvesRes = await fetch(`${getApiBase()}/cves/?limit=5000`);
         if (cvesRes.ok) {
           const apiData = await cvesRes.json();
           if (apiData && apiData.length > 0) {
@@ -1351,19 +1355,30 @@ export default function Dashboard() {
     setActiveKeywords((prev) => prev.filter((k) => k !== kw));
   };
 
-  // Feed source checklist filter handler
+  // Feed source checklist filter handler.
+  // Model: "all" is the sentinel for "every source ticked". Ticking sources is
+  // now explicit — the "All Sources" box is a true select-all/deselect-all master,
+  // and an empty selection (nothing ticked) shows nothing.
   const handleToggleFeedFilter = (feedName: string) => {
-    if (feedName === "all") {
-      setActiveFeedsFilter(["all"]);
-      return;
-    }
+    const allNames = [...feeds, ...webScrapers].map((s: any) => s.name);
+    const isFull = (names: string[]) =>
+      allNames.length > 0 && allNames.every((n) => names.includes(n));
+
     setActiveFeedsFilter((prev) => {
-      const without = prev.filter((f) => f !== "all");
-      if (without.includes(feedName)) {
-        const next = without.filter((f) => f !== feedName);
-        return next.length === 0 ? ["all"] : next;
+      // Expand the "all" sentinel into the concrete list so individual boxes are really on.
+      const selected = prev.includes("all") ? [...allNames] : prev.filter((f) => f !== "all");
+
+      if (feedName === "all") {
+        // Master: everything on ⇒ turn all off (show nothing); otherwise turn all on.
+        return isFull(selected) ? [] : ["all"];
       }
-      return [...without, feedName];
+
+      const next = selected.includes(feedName)
+        ? selected.filter((f) => f !== feedName)   // untick the one source you don't want
+        : [...selected, feedName];
+
+      // Collapse a full set back to the "all" sentinel (re-ticks master); empty stays empty.
+      return isFull(next) ? ["all"] : next;
     });
   };
 
@@ -1935,7 +1950,8 @@ export default function Dashboard() {
                     </label>
                     {[...feeds, ...webScrapers].map((src: any) => {
                       const name = src.name;
-                      const isChecked = activeFeedsFilter.includes(name);
+                      // ponytail: "All Sources" selected ⇒ every source box shows checked too
+                      const isChecked = activeFeedsFilter.includes("all") || activeFeedsFilter.includes(name);
                       const count = vulnerabilities.filter(v =>
                         (v.source || "").toLowerCase().trim() === name.toLowerCase().trim()
                       ).length;
@@ -2130,6 +2146,7 @@ export default function Dashboard() {
                     vulnerabilities={filteredVulnerabilities}
                     showColumnManager={showColMgr}
                     onCloseColumnManager={() => setShowColMgr(false)}
+                    timezone={timezone}
                   />
                 </div>
               </div>

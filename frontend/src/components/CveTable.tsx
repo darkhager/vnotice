@@ -22,6 +22,7 @@ interface CveTableProps {
   vulnerabilities?: any[];
   showColumnManager?: boolean;
   onCloseColumnManager?: () => void;
+  timezone?: string;
 }
 
 type ColKey = "cve" | "product" | "severity" | "scores" | "date" | "ingested" | "source";
@@ -51,6 +52,33 @@ function loadLS<T>(key: string, fallback: T): T {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
 }
 
+// ponytail: map the UI's tz codes to IANA zones and render the stored UTC
+// timestamp in the chosen zone via Intl (platform, no deps).
+const TZ_IANA: Record<string, string> = {
+  UTC: "UTC",
+  PST: "America/Los_Angeles",
+  EST: "America/New_York",
+  ICT: "Asia/Bangkok",
+};
+
+function formatInTz(iso: string, tz: string): string {
+  if (!iso) return "";
+  // Stored value is naive UTC ("YYYY-MM-DD HH:MM:SS[.ffffff]"); mark it UTC so
+  // it's parsed as UTC rather than the browser's local zone.
+  let s = iso.includes("T") ? iso : iso.replace(" ", "T");
+  if (!/[zZ]|[+-]\d\d:?\d\d$/.test(s)) s += "Z";
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return iso.replace("T", " ").slice(0, 16);
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TZ_IANA[tz] || "UTC",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(d);
+  const p: Record<string, string> = {};
+  for (const part of parts) p[part.type] = part.value;
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}`;
+}
+
 const initialData: CveItem[] = [
   { id: "CVE-2024-3094",  name: "XZ Utils Downstream SSH Backdoor",          vendor: "XZ Utils",   product: "XZ Utils",  severity: "Critical", score: 10.0, epss: 0.84805, date: "2024-03-29", url: "https://nvd.nist.gov/vuln/detail/CVE-2024-3094" },
   { id: "CVE-2024-3400",  name: "Palo Alto PAN-OS Command Injection",         vendor: "Palo Alto",  product: "PAN-OS",    severity: "Critical", score: 10.0, epss: 0.956,   date: "2024-04-12", url: "https://nvd.nist.gov/vuln/detail/CVE-2024-3400" },
@@ -58,9 +86,17 @@ const initialData: CveItem[] = [
   { id: "CVE-2023-38831", name: "WinRAR Remote Code Execution",               vendor: "Microsoft",  product: "Windows OS",severity: "High",     score: 7.8,  epss: 0.93865, date: "2023-08-24", url: "https://nvd.nist.gov/vuln/detail/CVE-2023-38831" },
 ];
 
-export default function CveTable({ textSize = "md", vulnerabilities, showColumnManager, onCloseColumnManager }: CveTableProps) {
+// ponytail: window size — mount this many rows up front, reveal +this on scroll.
+// Keeps a 3000-row list from rendering thousands of <tr> at once.
+const PAGE = 150;
+
+export default function CveTable({ textSize = "md", vulnerabilities, showColumnManager, onCloseColumnManager, timezone = "UTC" }: CveTableProps) {
   const [data,     setData]     = useState<CveItem[]>(initialData);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [visibleCount, setVisibleCount] = useState(PAGE);
+
+  // Header label for the Ingested column reflects the active timezone.
+  const colLabel = (col: ColKey) => col === "ingested" ? `Ingested (${timezone})` : COLUMN_LABELS[col];
 
   const [columnOrder, setColumnOrder] = useState<ColKey[]>(() => {
     const saved = loadLS<ColKey[]>(LS_ORDER, ALL_COLUMNS);
@@ -75,6 +111,7 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
 
   useEffect(() => {
     if (vulnerabilities !== undefined) setData(vulnerabilities.length > 0 ? vulnerabilities : []);
+    setVisibleCount(PAGE);   // ponytail: new filter result ⇒ window back to the top
   }, [vulnerabilities]);
 
   const scale = ({ sm: 0.9, md: 1.0, lg: 1.15, xl: 1.35, "2xl": 1.55 } as Record<string, number>)[textSize] ?? 1.0;
@@ -226,13 +263,13 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
           </td>
         );
       case "ingested": {
-        // Stored UTC ISO string → show "YYYY-MM-DD HH:MM" as-is (no tz shift).
-        const ts = cve.ingestedAt ? cve.ingestedAt.replace("T", " ").slice(0, 16) : "";
+        // Stored UTC ISO string → convert to the user's selected timezone.
+        const ts = formatInTz(cve.ingestedAt || "", timezone);
         return (
           <td key={col} className="py-3 px-4 text-[0.85em] align-top overflow-hidden font-mono text-gray-400"
             style={{ width: widths.ingested, minWidth: widths.ingested }}>
             {ts
-              ? <span title={cve.ingestedAt}>{ts}</span>
+              ? <span title={`${cve.ingestedAt} UTC`}>{ts}</span>
               : <span className="text-gray-600">—</span>}
           </td>
         );
@@ -267,20 +304,29 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
             <button key={col} onClick={() => toggleColumn(col)}
               className="flex items-center gap-1 px-2 py-0.5 text-[0.7em] font-semibold rounded-lg border border-white/10 bg-white/5 text-gray-400 hover:text-white hover:border-sky-500/40 transition">
               <Eye className="w-2.5 h-2.5" />
-              {COLUMN_LABELS[col]}
+              {colLabel(col)}
             </button>
           ))}
         </div>
       )}
 
-      <div className="overflow-x-auto w-full flex-1 min-h-0">
+      <div
+        className="overflow-x-auto w-full flex-1 min-h-0"
+        onScroll={(e) => {
+          // ponytail: near the bottom ⇒ reveal the next page of rows (load-on-scroll).
+          const el = e.currentTarget;
+          if (el.scrollHeight - el.scrollTop - el.clientHeight < 400) {
+            setVisibleCount((c) => (c < data.length ? c + PAGE : c));
+          }
+        }}
+      >
         <table className="text-left border-collapse select-text" style={{ tableLayout: "fixed", width: totalWidth || "100%" }}>
           <thead>
             <tr className="bg-black/30 border-b border-white/10 text-[0.7em] uppercase font-bold tracking-widest text-gray-400 select-none">
               {visibleCols.map((col) => (
                 <th key={col} className="relative overflow-hidden" style={{ width: widths[col], minWidth: widths[col], maxWidth: widths[col] }}>
                   <div className="px-4 py-3">
-                    <span className="truncate">{COLUMN_LABELS[col]}</span>
+                    <span className="truncate">{colLabel(col)}</span>
                   </div>
                   {/* Resize handle — drag right edge to resize */}
                   <div
@@ -303,7 +349,7 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
                 </td>
               </tr>
             ) : (
-              data.map((cve, idx) => (
+              data.slice(0, visibleCount).map((cve, idx) => (
                 <tr key={cve._key || `${cve.id}_${idx}`} className="hover:bg-white/[0.015] transition-colors">
                   {visibleCols.map((col) => renderCell(col, cve))}
                 </tr>
@@ -329,7 +375,7 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
                 return (
                   <div key={col} className={`flex items-center gap-2 px-4 py-2.5 hover:bg-white/5 transition ${isHidden ? "opacity-50" : ""}`}>
                     <span className={`flex-1 text-sm font-medium ${isHidden ? "text-gray-500" : "text-gray-200"}`}>
-                      {COLUMN_LABELS[col]}
+                      {colLabel(col)}
                     </span>
                     <button onClick={() => moveColumn(col, -1)} disabled={idx === 0}
                       className="p-1 text-gray-500 hover:text-white disabled:opacity-20 disabled:cursor-not-allowed rounded transition"

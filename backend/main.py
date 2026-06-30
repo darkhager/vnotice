@@ -199,7 +199,7 @@ def update_my_config(
 @app.get("/cves/", response_model=List[schemas.CVEResponse])
 def get_cves(
     skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=1000),
+    limit: int = Query(20, ge=1, le=20000),  # ponytail: cap raised so the client can pull the whole table; global date-sorted window was starving low-volume vendor feeds (Palo/Splunk/Check Point/Ubuntu)
     severity: Optional[List[str]] = Query(None),
     vendor: Optional[str] = None,
     product: Optional[str] = None,
