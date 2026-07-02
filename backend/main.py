@@ -42,17 +42,32 @@ _CVES_TTL = 20.0
 # Create all tables on startup
 models.Base.metadata.create_all(bind=engine)
 
-# ponytail: lightweight additive migration — create_all() won't ALTER existing
-# tables, so add the keywords column to a pre-existing cves table if missing.
+# ponytail: self-healing additive migration. create_all() creates missing
+# TABLES but never adds missing COLUMNS to an existing table, so a DB written by
+# an older version lacks any column added since (e.g. notify_line/line_channel_token).
+# Reflect each model's columns and ALTER in whatever the live table is missing —
+# so a version bump that adds a column just works on restart, no manual migration
+# and no config loss. Additive only: never drops/renames, never touches data.
 def _ensure_columns():
-    try:
-        with engine.begin() as conn:
+    from sqlalchemy import inspect as _sa_inspect
+    insp = _sa_inspect(engine)
+    tables = set(insp.get_table_names())
+    for table in models.Base.metadata.sorted_tables:
+        if table.name not in tables:
+            continue  # create_all() already made brand-new tables in full
+        existing = {c["name"] for c in insp.get_columns(table.name)}
+        for col in table.columns:
+            if col.name in existing:
+                continue
+            coltype = col.type.compile(engine.dialect)
             try:
-                conn.exec_driver_sql("ALTER TABLE cves ADD COLUMN keywords TEXT")
-            except Exception:
-                pass  # column already exists
-    except Exception as e:
-        logger.warning(f"keywords column migration skipped: {e}")
+                with engine.begin() as conn:
+                    conn.exec_driver_sql(
+                        f'ALTER TABLE "{table.name}" ADD COLUMN "{col.name}" {coltype}'
+                    )
+                logger.warning(f"migration: added column {table.name}.{col.name} ({coltype})")
+            except Exception as e:
+                logger.warning(f"migration: could not add {table.name}.{col.name}: {e}")
 
 _ensure_columns()
 
