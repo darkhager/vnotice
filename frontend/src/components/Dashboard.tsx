@@ -375,6 +375,11 @@ export default function Dashboard() {
   const [isRefreshingEpss, setIsRefreshingEpss] = useState(false);
   const [syncCountdown, setSyncCountdown] = useState<number>(900);
   const [vulnerabilities, setVulnerabilities] = useState<any[]>([]);
+  // CVE time window: 30 = last 30 days (lighter default), null = all time.
+  // Drives the server-side `days` filter so the payload itself is smaller.
+  const [timeWindowDays, setTimeWindowDays] = useState<number | null>(30);
+  const cvesUrl = (days: number | null) =>
+    `${getApiBase()}/cves/?limit=5000${days ? `&days=${days}` : ""}`;
 
   // Alert Rules state
   const [alertRules, setAlertRules] = useState<AlertRule[]>([]);
@@ -714,33 +719,37 @@ export default function Dashboard() {
     }
     setWebScrapers(loadedScrapers);
 
-    // Sync from active database if online
-    const fetchApiCves = async () => {
-      try {
-        const res = await fetch(`${getApiBase()}/cves/?limit=5000`);
-        if (res.ok) {
-          const apiData = await res.json();
-          if (apiData && apiData.length > 0) {
-            const mapped = apiData.map((c: any) => {
-              const v = mapApiCve(c);
-              return { ...v, url: ensureAbsoluteCveUrl(c.reference_url, c.cve_id) };
-            });
-            setVulnerabilities(mapped);
-            localStorage.setItem("vnotice_vulnerabilities", JSON.stringify(mapped));
-            appendLog(`[NET] Active PostgreSQL database connected. Syncing threat stream...`);
-            return;
-          }
-        }
-      } catch (err) {
-        // Fail silently
-      }
-      appendLog(`[NET] Local SQLite database active. Offline fallback active.`);
-    };
-    fetchApiCves();
+    // CVE fetch lives in its own effect below so it can re-run when the
+    // time window (last 30 days / all) changes.
 
     // Do NOT auto-restore the last active profile — always show account
     // selection on page load so the user explicitly picks their account.
   }, []);
+
+  // Load CVEs from the active DB. Re-runs whenever the time window changes,
+  // so "View all" simply re-fetches without the `days` filter.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(cvesUrl(timeWindowDays));
+        if (!res.ok) return;
+        const apiData = await res.json();
+        // Only overwrite cached vulns on a non-empty response (keeps offline data).
+        if (cancelled || !apiData || apiData.length === 0) return;
+        const mapped = apiData.map((c: any) => {
+          const v = mapApiCve(c);
+          return { ...v, url: ensureAbsoluteCveUrl(c.reference_url, c.cve_id) };
+        });
+        setVulnerabilities(mapped);
+        localStorage.setItem("vnotice_vulnerabilities", JSON.stringify(mapped));
+        appendLog(`[NET] Active database connected (${timeWindowDays ? `last ${timeWindowDays} days` : "all time"}).`);
+      } catch {
+        appendLog(`[NET] Local SQLite database active. Offline fallback active.`);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [timeWindowDays]);
 
   const activeProfile = profiles.find((p) => p.id === activeProfileId);
 
@@ -984,7 +993,7 @@ export default function Dashboard() {
       const res = await fetch(`${getApiBase()}/cves/refresh-epss`, { method: "POST" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const r = await res.json();
-      const cvesRes = await fetch(`${getApiBase()}/cves/?limit=5000`);
+      const cvesRes = await fetch(cvesUrl(timeWindowDays));
       if (cvesRes.ok) {
         const apiData = await cvesRes.json();
         const mapped = apiData.map((c: any) => {
@@ -1036,7 +1045,7 @@ export default function Dashboard() {
         appendLog(`[OK] Discovered and parsed ${result.new_cves_added} new vulnerability records.`);
         
         // Refetch all CVEs from backend to update Threat Stream!
-        const cvesRes = await fetch(`${getApiBase()}/cves/?limit=5000`);
+        const cvesRes = await fetch(cvesUrl(timeWindowDays));
         if (cvesRes.ok) {
           const apiData = await cvesRes.json();
           if (apiData && apiData.length > 0) {
@@ -1979,6 +1988,38 @@ export default function Dashboard() {
                   </div>
                 </div>
 
+                {/* Time window — default last 30 days (lighter payload); View all loads everything */}
+                <div className="space-y-2 pt-2.5 border-t border-white/5">
+                  <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                    Time Window
+                  </span>
+                  <div className="flex gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setTimeWindowDays(30)}
+                      className={`flex-1 px-2 py-1.5 text-[0.72em] font-bold rounded-lg border transition ${
+                        timeWindowDays === 30
+                          ? "bg-sky-500/20 border-sky-500/40 text-sky-300"
+                          : "bg-white/[0.02] border-white/10 text-gray-400 hover:text-white"
+                      }`}
+                    >
+                      Last 30 days
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTimeWindowDays(null)}
+                      title="Loads every CVE — heavier on resources"
+                      className={`flex-1 px-2 py-1.5 text-[0.72em] font-bold rounded-lg border transition ${
+                        timeWindowDays === null
+                          ? "bg-sky-500/20 border-sky-500/40 text-sky-300"
+                          : "bg-white/[0.02] border-white/10 text-gray-400 hover:text-white"
+                      }`}
+                    >
+                      View all
+                    </button>
+                  </div>
+                </div>
+
                 {/* Reset button */}
                 <div className="pt-3 border-t border-white/5 space-y-2">
                   <button
@@ -1993,6 +2034,7 @@ export default function Dashboard() {
                       setSearchQuery("");
                       setEpssMin("");
                       setEpssMax("");
+                      setTimeWindowDays(30);
                       appendLog("[SYS] Reset Threat Stream filters to defaults.");
                     }}
                     className="w-full px-3 py-2 text-xs font-bold bg-white/[0.01] hover:bg-red-500/10 border border-white/5 hover:border-red-500/30 text-gray-400 hover:text-red-400 rounded-xl transition duration-200 flex items-center justify-center gap-1.5"

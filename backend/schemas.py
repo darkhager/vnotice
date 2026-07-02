@@ -66,6 +66,7 @@ class UserConfigUpdate(BaseModel):
     notify_telegram: Optional[bool] = None
     notify_slack: Optional[bool] = None
     notify_teams: Optional[bool] = None
+    notify_line: Optional[bool] = None
     notify_sms: Optional[bool] = None
 
     discord_webhook: Optional[str] = None
@@ -73,6 +74,7 @@ class UserConfigUpdate(BaseModel):
     telegram_chat_id: Optional[str] = None
     slack_webhook: Optional[str] = None
     teams_webhook: Optional[str] = None
+    line_channel_token: Optional[str] = None
     smtp_host: Optional[str] = None
     smtp_port: Optional[int] = None
     smtp_username: Optional[str] = None
@@ -99,6 +101,7 @@ class UserConfigResponse(BaseModel):
     notify_telegram: bool
     notify_slack: bool
     notify_teams: bool
+    notify_line: bool = False
     notify_sms: bool = False
 
     discord_webhook: Optional[str] = None
@@ -106,6 +109,7 @@ class UserConfigResponse(BaseModel):
     telegram_chat_id: Optional[str] = None
     slack_webhook: Optional[str] = None
     teams_webhook: Optional[str] = None
+    line_channel_token: Optional[str] = None
     smtp_host: Optional[str] = None
     smtp_port: Optional[int] = None
     smtp_username: Optional[str] = None
@@ -182,6 +186,13 @@ class TelegramAlertRequest(NotifAlertRequest):
 class TelegramTestRequest(BaseModel):
     bot_token: str
     chat_id: str
+
+# LINE (Messaging API — broadcast to the Official Account's friends)
+class LineAlertRequest(NotifAlertRequest):
+    channel_token: str
+
+class LineTestRequest(BaseModel):
+    channel_token: str
 
 # Email (SMTP)
 class EmailAlertRequest(NotifAlertRequest):

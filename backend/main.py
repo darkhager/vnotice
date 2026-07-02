@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Query, BackgroundTasks, Body
+from fastapi import FastAPI, Depends, HTTPException, status, Query, BackgroundTasks, Body, Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -15,6 +15,7 @@ import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import httpx
+from pydantic import TypeAdapter
 
 import logging
 
@@ -29,6 +30,14 @@ from rss_parser import RSSIngestionService
 logger = logging.getLogger("vnotice")
 
 _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 0}
+
+# ponytail: short-TTL response cache for GET /cves/. The CVE table only changes
+# on /sync/ (and epss refresh / checkpoint clear), so identical queries — the
+# dashboard's default view shared across operators/auto-refresh — skip the DB
+# read and the Pydantic serialization of thousands of rows. Cleared on writes.
+_CVE_LIST_ADAPTER = TypeAdapter(List[schemas.CVEResponse])
+_CVES_CACHE: dict = {}     # query-string -> (timestamp, body_bytes)
+_CVES_TTL = 20.0
 
 # Create all tables on startup
 models.Base.metadata.create_all(bind=engine)
@@ -198,17 +207,28 @@ def update_my_config(
 
 @app.get("/cves/", response_model=List[schemas.CVEResponse])
 def get_cves(
+    request: Request,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=20000),  # ponytail: cap raised so the client can pull the whole table; global date-sorted window was starving low-volume vendor feeds (Palo/Splunk/Check Point/Ubuntu)
     severity: Optional[List[str]] = Query(None),
     vendor: Optional[str] = None,
     product: Optional[str] = None,
     search: Optional[str] = None,
+    days: Optional[int] = Query(None, ge=1),  # ponytail: only CVEs published within the last N days; lighter default payload. omit = all
     db: Session = Depends(get_db)
 ):
+    # ponytail: serve a recent identical query straight from cache (see _CVES_CACHE).
+    cache_key = str(request.url.query)
+    _now = _time.time()
+    _hit = _CVES_CACHE.get(cache_key)
+    if _hit and _now - _hit[0] < _CVES_TTL:
+        return Response(content=_hit[1], media_type="application/json")
     try:
         query = db.query(models.CVE)
 
+        if days:
+            cutoff = datetime.utcnow() - timedelta(days=days)
+            query = query.filter(models.CVE.published_date >= cutoff)
         if severity:
             if "all" not in [s.lower() for s in severity]:
                 from sqlalchemy import or_
@@ -224,7 +244,12 @@ def get_cves(
                 models.CVE.description.ilike(f"%{search}%")
             )
 
-        return query.order_by(models.CVE.published_date.desc()).offset(skip).limit(limit).all()
+        rows = query.order_by(models.CVE.published_date.desc()).offset(skip).limit(limit).all()
+        body = _CVE_LIST_ADAPTER.dump_json([schemas.CVEResponse.model_validate(r) for r in rows])
+        if len(_CVES_CACHE) > 64:        # bound memory from varied filter combos
+            _CVES_CACHE.clear()
+        _CVES_CACHE[cache_key] = (_now, body)
+        return Response(content=body, media_type="application/json")
     except Exception as exc:
         # Fail-safe: DB unavailable — serve from per-source files (degraded filtering).
         logger.error(f"/cves/ DB query failed, serving from source files: {exc}")
@@ -406,6 +431,12 @@ async def _evaluate_triggers(user_id: str, db_url: str = ""):
                             await client.post(
                                 f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
                                 json={"chat_id": cfg.telegram_chat_id, "text": text_body, "parse_mode": "HTML"},
+                            )
+                        if cfg.notify_line and cfg.line_channel_token:
+                            await client.post(
+                                "https://api.line.me/v2/bot/message/broadcast",
+                                headers={"Authorization": f"Bearer {cfg.line_channel_token}"},
+                                json={"messages": [{"type": "text", "text": _build_line_text(**alert_kwargs)}]},
                             )
                         if (cfg.notify_email and cfg.smtp_host and cfg.smtp_username
                                 and cfg.smtp_password and cfg.smtp_to_address):
@@ -600,6 +631,7 @@ def sync_threat_sources(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database transaction error: {e}")
+    _CVES_CACHE.clear()   # ponytail: new CVEs written ⇒ drop the /cves/ response cache
 
     # Evaluate notification triggers against newly added CVEs (background, non-blocking)
     if new_cves_added > 0:
@@ -629,6 +661,7 @@ def clear_checkpoint_cves(
         )
     ).delete(synchronize_session=False)
     db.commit()
+    _CVES_CACHE.clear()   # ponytail: rows deleted ⇒ drop the /cves/ response cache
     return {"deleted": deleted, "message": f"Removed {deleted} Check Point CVE records."}
 
 
@@ -692,11 +725,19 @@ def root():
 import time as _time
 _APP_START = _time.time()
 
+# ponytail: cache the process scan — process_iter() over every PID on the box is
+# the dominant /health/ cost, and the backend/frontend PIDs rarely change.
+_SUBPROC_CACHE: dict = {"ts": 0.0, "data": []}
+_SUBPROC_TTL = 15.0
+
 def _vnotice_subprocesses() -> list:
     """Best-effort list of the OS processes that make up this deployment —
     backend (uvicorn) + frontend (Next.js) — so Engine Status shows every
     subprocess, not just the API process. ponytail: psutil cmdline match,
     scoped to the current user's own processes."""
+    now = _time.time()
+    if _SUBPROC_CACHE["data"] and now - _SUBPROC_CACHE["ts"] < _SUBPROC_TTL:
+        return _SUBPROC_CACHE["data"]
     procs: list = []
     try:
         import psutil
@@ -727,6 +768,8 @@ def _vnotice_subprocesses() -> list:
         except Exception:
             continue
     procs.sort(key=lambda x: x["role"])
+    _SUBPROC_CACHE["ts"] = now
+    _SUBPROC_CACHE["data"] = procs
     return procs
 
 
@@ -753,7 +796,7 @@ def engine_health(db: Session = Depends(get_db)):
     # System metrics via psutil
     try:
         import psutil, os
-        result["cpu_percent"] = psutil.cpu_percent(interval=0.2)
+        result["cpu_percent"] = psutil.cpu_percent(interval=None)  # ponytail: non-blocking (was interval=0.2)
         vm = psutil.virtual_memory()
         result["memory"] = {
             "total_gb": round(vm.total / 1e9, 2),
@@ -771,7 +814,7 @@ def engine_health(db: Session = Depends(get_db)):
             "pid":        proc.pid,
             "status":     proc.status(),
             "mem_mb":     round(proc.memory_info().rss / 1e6, 1),
-            "cpu_percent": proc.cpu_percent(interval=0.1),
+            "cpu_percent": proc.cpu_percent(interval=None),  # ponytail: non-blocking (was interval=0.1)
             "threads":    proc.num_threads(),
         }
     except ImportError:
@@ -818,6 +861,7 @@ def refresh_epss(db: Session = Depends(get_db)):
         if val is not None:
             found += 1
     db.commit()
+    _CVES_CACHE.clear()   # ponytail: epss updated ⇒ drop the /cves/ response cache
     return {"total": len(rows), "with_epss": found, "na": len(rows) - found}
 
 
@@ -1028,6 +1072,42 @@ async def send_telegram_alert(
         raise HTTPException(status_code=502, detail=f"Telegram error: {data.get('description', resp.text[:200])}")
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Telegram request timed out.")
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Network error: {exc}")
+
+
+def _build_line_text(title: str, severity: str, cve_id: str,
+                     description: Optional[str], reference_url: Optional[str]) -> str:
+    # LINE text messages are plain text (no HTML), 5000-char limit.
+    lines = [f"🚨 [{cve_id}] {title}", f"Severity: {severity.upper()}"]
+    if description:
+        lines.append(f"\n{description[:300]}{'…' if len(description or '') > 300 else ''}")
+    if reference_url:
+        lines.append(f"\n{reference_url}")
+    return "\n".join(lines)
+
+
+@app.post("/notifications/test-line", status_code=200)
+async def test_line_broadcast(
+    req: schemas.LineTestRequest,
+):
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                "https://api.line.me/v2/bot/message/broadcast",
+                headers={"Authorization": f"Bearer {req.channel_token}"},
+                json={"messages": [{"type": "text",
+                    "text": "✅ CVE Monitor — Test Alert\nLINE notifications are configured correctly."}]},
+            )
+        if resp.status_code == 200:
+            return {"status": "ok", "message": "Test message broadcast to LINE."}
+        try:
+            detail = resp.json().get("message", resp.text[:200])
+        except Exception:
+            detail = resp.text[:200]
+        raise HTTPException(status_code=502, detail=f"LINE error ({resp.status_code}): {detail}")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="LINE request timed out.")
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Network error: {exc}")
 

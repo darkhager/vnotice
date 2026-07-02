@@ -107,6 +107,7 @@ class UserConfig(Base):
     notify_telegram = Column(Boolean, default=False)
     notify_slack = Column(Boolean, default=False)
     notify_teams = Column(Boolean, default=False)
+    notify_line = Column(Boolean, default=False)
 
     # Notification Channel Targets
     # Secret-bearing columns are encrypted at rest via EncryptedText.
@@ -115,6 +116,8 @@ class UserConfig(Base):
     telegram_chat_id = Column(String(100), nullable=True)
     slack_webhook = Column(EncryptedText, nullable=True)
     teams_webhook = Column(EncryptedText, nullable=True)
+    # LINE Messaging API broadcast — one Channel Access Token per Official Account.
+    line_channel_token = Column(EncryptedText, nullable=True)
     smtp_host = Column(String(255), nullable=True)
     smtp_port = Column(Integer, default=587)
     smtp_username = Column(String(255), nullable=True)
