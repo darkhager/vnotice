@@ -282,6 +282,68 @@ class RSSIngestionService:
         return all_items
 
     @staticmethod
+    def _fetch_nvd_paged(query: str, label: str, max_results: int = 40):
+        """Fetch the newest CVEs for an NVD 2.0 filter query (value already
+        URL-encoded), e.g. 'keywordSearch=ivanti' or a 'virtualMatchString=cpe...'.
+
+        Used for vendors whose own site can't be scraped like Splunk: F5's
+        advisory portal is a Salesforce SPA (no data in raw HTML) and Ivanti's
+        is a JS blog, so we pull their CVEs from NVD instead — real CVSS,
+        severity and CPE-derived vendor/product, nothing fabricated.
+
+        Same two-step startIndex trick as fetch_nvd_api (NVD returns results in
+        ascending published order, so the last page holds the newest records).
+        Shared by the keyword and CPE-vendor feed routes.
+        """
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        base = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+
+        try:
+            req1 = urllib.request.Request(f"{base}?{query}&resultsPerPage=1", headers=headers)
+            with urllib.request.urlopen(req1, timeout=15) as r1:
+                total = json.loads(r1.read().decode("utf-8")).get("totalResults", 0)
+
+            if total == 0:
+                logger.warning(f"NVD {label} returned totalResults=0 — skipping")
+                return []
+
+            start_idx = max(0, total - max_results)
+            fetch_url = f"{base}?{query}&resultsPerPage={max_results}&startIndex={start_idx}"
+            logger.info(f"NVD {label}: total={total}, fetching {max_results} from startIndex={start_idx}")
+
+            req2 = urllib.request.Request(fetch_url, headers=headers)
+            with urllib.request.urlopen(req2, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            logger.error(f"Error fetching NVD {label}: {e}")
+            return []
+
+        items = []
+        for vuln in data.get("vulnerabilities", []):
+            item = RSSIngestionService._parse_nvd_vuln(vuln, fetch_epss=False)
+            if item:
+                items.append(item)
+        items.sort(key=lambda x: x["published_date"], reverse=True)  # newest first
+        logger.info(f"NVD {label}: parsed {len(items)} CVEs")
+        return items
+
+    @staticmethod
+    def fetch_nvd_by_keyword(keyword: str, max_results: int = 40):
+        """Newest CVEs matching a vendor keyword (space-separated terms are
+        AND-matched by NVD). Good for distinctive vendor tokens like 'ivanti'."""
+        return RSSIngestionService._fetch_nvd_paged(
+            f"keywordSearch={urllib.parse.quote(keyword)}", f"keyword '{keyword}'", max_results)
+
+    @staticmethod
+    def fetch_nvd_by_cpe(cpe_match: str, max_results: int = 40):
+        """Newest CVEs whose CPE matches a vendor, e.g.
+        'cpe:2.3:*:f5:*:*:*:*:*:*:*:*:*'. Zero-noise and covers every product
+        under that vendor — used for F5 and MobileIron, whose bare keyword search
+        is either too noisy ('f5' matches unrelated text) or too narrow."""
+        return RSSIngestionService._fetch_nvd_paged(
+            f"virtualMatchString={urllib.parse.quote(cpe_match)}", f"cpe '{cpe_match}'", max_results)
+
+    @staticmethod
     def fetch_splunk_advisories(max_advisories: int = 60):
         """Scrape the Splunk Security Advisories archive (advisory.splunk.com).
 

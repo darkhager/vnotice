@@ -601,6 +601,7 @@ export default function Dashboard() {
         "advisories.splunk.com",
         "tools.cisco.com/security/center/rss",  // returns HTML page, not RSS
         "support.f5.com/csp/feed",              // returns HTML login page
+        "keywordsearch=f5+big-ip",              // narrow F5 feed superseded by CPE-vendor F5 (all products)
         "vulners.com/rss.xml",                  // feed returns nothing usable
         "seclists.org/rss/fulldisclosure.rss",  // Full Disclosure — feed returns nothing usable
       ];
@@ -616,6 +617,11 @@ export default function Dashboard() {
         { name: "Red Hat (RHEL)",    url: "https://access.redhat.com/hydra/rest/securitydata/cve.json", active: true },
         { name: "Rocky Linux",       url: "https://apollo.build.resf.org/api/v3/advisories/",     active: true },
         { name: "Microsoft (Windows)", url: "https://api.msrc.microsoft.com/cvrf/v3.0/updates",   active: true },
+        // F5 / MobileIron / Ivanti: sites unscrapeable (SPA/JS) — pulled from NVD.
+        // F5 & MobileIron by CPE vendor (all products, zero noise); Ivanti by keyword.
+        { name: "F5",                url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:f5:*:*:*:*:*:*:*:*:*", active: true },
+        { name: "MobileIron",        url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:mobileiron:*:*:*:*:*:*:*:*:*", active: true },
+        { name: "Ivanti",            url: "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=ivanti", active: true },
         { name: "Ubuntu Security",   url: "https://ubuntu.com/security/notices/rss.xml",          active: true },
         { name: "CERT.PL Security",  url: "https://cert.pl/en/rss.xml",                          active: true },
       ];
@@ -638,6 +644,11 @@ export default function Dashboard() {
         { name: "Splunk Security Advisories", url: "https://advisory.splunk.com/advisories", active: true },
         // Check Point advisories — JSON API (SPA page can't be scraped) for real severity/CVSS
         { name: "Check Point Advisories", url: "https://support.checkpoint.com/security-advisories", active: true },
+        // F5 / MobileIron / Ivanti — own sites unscrapeable (Salesforce SPA / JS blog); pulled from NVD.
+        // F5 & MobileIron by CPE vendor (all products, zero noise); Ivanti by distinctive keyword.
+        { name: "F5", url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:f5:*:*:*:*:*:*:*:*:*", active: true },
+        { name: "MobileIron", url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:mobileiron:*:*:*:*:*:*:*:*:*", active: true },
+        { name: "Ivanti", url: "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=ivanti", active: true },
         // OS / distro security
         { name: "Ubuntu Security", url: "https://ubuntu.com/security/notices/rss.xml", active: true },
         // Red Hat Security Data API (JSON) — real CVSS/severity

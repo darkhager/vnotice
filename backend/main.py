@@ -540,6 +540,21 @@ def sync_threat_sources(
         feeds_checked += 1
 
         # Real-data sources (rich item shape) — routed by URL, deduped via _insert_items
+        # NVD vendor-scoped feeds (e.g. Ivanti by keyword; F5 / MobileIron by CPE
+        # vendor — their own sites are unscrapeable). Must precede the generic NVD
+        # branch below. Routed by which filter param the feed URL carries.
+        if "services.nvd.nist.gov" in feed.url and "keywordSearch=" in feed.url:
+            from urllib.parse import urlparse, parse_qs
+            kw = (parse_qs(urlparse(feed.url).query).get("keywordSearch") or [""])[0]
+            if kw:
+                _insert_items(RSSIngestionService.fetch_nvd_by_keyword(kw), feed.name)
+            continue
+        if "services.nvd.nist.gov" in feed.url and "virtualMatchString=" in feed.url:
+            from urllib.parse import urlparse, parse_qs
+            cpe = (parse_qs(urlparse(feed.url).query).get("virtualMatchString") or [""])[0]
+            if cpe:
+                _insert_items(RSSIngestionService.fetch_nvd_by_cpe(cpe), feed.name)
+            continue
         if "services.nvd.nist.gov" in feed.url:
             _insert_items(RSSIngestionService.fetch_nvd_api(), feed.name)
             continue
