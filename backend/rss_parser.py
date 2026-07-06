@@ -446,6 +446,97 @@ class RSSIngestionService:
         return items
 
     @staticmethod
+    def fetch_fortinet_advisories(max_advisories: int = 60):
+        """Fetch Fortinet PSIRT advisories from FortiGuard's own RSS feed.
+
+        Fortinet keys its feed by FG-IR advisory IDs and — unlike most vendor
+        feeds — usually carries NO CVE ID in the item, but it DOES embed the
+        real CVSSv3 base score in every description. The generic RSS path
+        mangled both: it minted a random `CVE-FEED-<hash>` id (Python salts
+        string hashing per process, so the same advisory churned a new id on
+        every restart) and then overwrote severity/CVSS with random values.
+        So Fortinet gets a dedicated fetcher that keeps the real data:
+          * real CVE id when present, else the stable FG-IR id (deterministic
+            dedup, recognisable);
+          * real CVSS score parsed from the description → severity by NVD band.
+        Returns rich-shape dicts consumed by /sync/ via _insert_items.
+        """
+        url = "https://fortiguard.com/rss/ir.xml"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                xml = resp.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            logger.error(f"Error fetching Fortinet advisories: {e}")
+            return []
+
+        items = []
+        for block in re.findall(r"<item>(.*?)</item>", xml, re.DOTALL):
+            title_m = re.search(r"<title>(.*?)</title>", block, re.DOTALL)
+            link_m = re.search(r"<link>(.*?)</link>", block, re.DOTALL)
+            desc_m = re.search(r"<description>(.*?)</description>", block, re.DOTALL)
+            pub_m = re.search(r"<pubDate>(.*?)</pubDate>", block, re.DOTALL)
+            raw_desc = desc_m.group(1) if desc_m else ""
+
+            # Key on the real CVE when the advisory has one, else the stable FG-IR id
+            cve_m = re.search(r"CVE-\d{4}-\d+", block)
+            fgir_m = re.search(r"FG-IR-\d{2,4}-\d+", block)
+            if cve_m:
+                cve_id = cve_m.group(0)
+            elif fgir_m:
+                cve_id = fgir_m.group(0)
+            else:
+                continue  # nothing stable to key on — skip
+
+            # Real CVSSv3 base score, embedded as "CVSSv3 Score: <n>"
+            cvss_m = re.search(r"CVSSv3 Score:\s*(?:</strong>)?\s*([\d.]+)", raw_desc, re.DOTALL)
+            try:
+                cvss_score = float(cvss_m.group(1)) if cvss_m else None
+            except (ValueError, TypeError):
+                cvss_score = None
+            if cvss_score is None:
+                severity = "Medium"
+            elif cvss_score >= 9.0:
+                severity = "Critical"
+            elif cvss_score >= 7.0:
+                severity = "High"
+            elif cvss_score >= 4.0:
+                severity = "Medium"
+            else:
+                severity = "Low"
+
+            title = (title_m.group(1).strip() if title_m else "Fortinet advisory")
+            # Strip the CDATA/HTML down to readable text (drop the CVSS/Revised boilerplate)
+            text = re.sub(r"<[^>]+>", " ", raw_desc)
+            text = re.sub(r"CVSSv3 Score:\s*[\d.]+", "", text)
+            text = re.sub(r"Revised on[^<]*", "", text)
+            text = re.sub(r"\s+", " ", text).strip() or title
+
+            pub = parse_date(pub_m.group(1)) if pub_m else datetime.utcnow()
+            if getattr(pub, "tzinfo", None):
+                pub = pub.replace(tzinfo=None)
+
+            items.append({
+                "cve_id":         cve_id,
+                "title":          title[:200],
+                "description":    text[:600],
+                "severity":       severity,
+                "cvss_score":     cvss_score,
+                "epss":           None,   # filled with real EPSS on sync; FG-IR ids stay N/A
+                "vendor":         "Fortinet",
+                "product":        "FortiOS",
+                "reference_url":  (link_m.group(1).strip() if link_m else url),
+                "published_date": pub,
+            })
+            if len(items) >= max_advisories:
+                break
+
+        items.sort(key=lambda x: x["published_date"], reverse=True)
+        logger.info(f"Fortinet advisories: parsed {len(items)} CVEs")
+        return items
+
+    @staticmethod
     def fetch_checkpoint_advisories(max_advisories: int = 80):
         """Fetch Check Point Security Advisories from the support-center JSON API.
 

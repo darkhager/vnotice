@@ -561,6 +561,12 @@ def sync_threat_sources(
         if "advisory.splunk.com" in feed.url:
             _insert_items(RSSIngestionService.fetch_splunk_advisories(), feed.name)
             continue
+        if "fortiguard" in feed.url or "fortinet.com" in feed.url:
+            # Fortinet's own PSIRT RSS, but parsed by a dedicated fetcher: the
+            # generic RSS path minted unstable CVE-FEED-<hash> ids and randomised
+            # CVSS/severity. This keeps the real CVSS + stable FG-IR/CVE id.
+            _insert_items(RSSIngestionService.fetch_fortinet_advisories(), feed.name)
+            continue
         if "support.checkpoint.com" in feed.url:
             _insert_items(RSSIngestionService.fetch_checkpoint_advisories(), feed.name)
             continue
