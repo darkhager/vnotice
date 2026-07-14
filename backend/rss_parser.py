@@ -282,37 +282,28 @@ class RSSIngestionService:
         return all_items
 
     @staticmethod
-    def _fetch_nvd_paged(query: str, label: str, max_results: int = 40):
-        """Fetch the newest CVEs for an NVD 2.0 filter query (value already
-        URL-encoded), e.g. 'keywordSearch=ivanti' or a 'virtualMatchString=cpe...'.
+    def _fetch_nvd_paged(query: str, label: str, days: int = 30, max_results: int = 200):
+        """Fetch CVEs for an NVD 2.0 filter query (value already URL-encoded, e.g.
+        a 'virtualMatchString=cpe...') published in the last `days` days.
 
-        Used for vendors whose own site can't be scraped like Splunk: F5's
-        advisory portal is a Salesforce SPA (no data in raw HTML) and Ivanti's
-        is a JS blog, so we pull their CVEs from NVD instead — real CVSS,
-        severity and CPE-derived vendor/product, nothing fabricated.
-
-        Same two-step startIndex trick as fetch_nvd_api (NVD returns results in
-        ascending published order, so the last page holds the newest records).
-        Shared by the keyword and CPE-vendor feed routes.
+        Used for the per-product vendor feeds (F5 / Ivanti / MobileIron). A
+        product+date filter returns only NVD-analysed CVEs, which always carry a
+        real CPE-derived vendor/product — so they're correctly labelled by
+        construction, no heuristics — and the 30-day window keeps each vendor's
+        set small and current (a vendor publishes only a handful a month; e.g.
+        F5 ~6, Ivanti ~2 over 30d). The generic un-analysable newest-100 firehose
+        is handled separately by fetch_nvd_api and lands as 'Various'.
         """
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         base = "https://services.nvd.nist.gov/rest/json/cves/2.0"
-
+        end = datetime.utcnow()
+        start = end - timedelta(days=days)
+        # NVD wants ISO-8601 with millis and LITERAL colons (URL-encoding them 404s)
+        iso = lambda d: d.strftime("%Y-%m-%dT%H:%M:%S.000")
+        url = (f"{base}?{query}&pubStartDate={iso(start)}&pubEndDate={iso(end)}"
+               f"&resultsPerPage={max_results}")
         try:
-            req1 = urllib.request.Request(f"{base}?{query}&resultsPerPage=1", headers=headers)
-            with urllib.request.urlopen(req1, timeout=15) as r1:
-                total = json.loads(r1.read().decode("utf-8")).get("totalResults", 0)
-
-            if total == 0:
-                logger.warning(f"NVD {label} returned totalResults=0 — skipping")
-                return []
-
-            start_idx = max(0, total - max_results)
-            fetch_url = f"{base}?{query}&resultsPerPage={max_results}&startIndex={start_idx}"
-            logger.info(f"NVD {label}: total={total}, fetching {max_results} from startIndex={start_idx}")
-
-            req2 = urllib.request.Request(fetch_url, headers=headers)
-            with urllib.request.urlopen(req2, timeout=30) as resp:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             logger.error(f"Error fetching NVD {label}: {e}")
@@ -324,24 +315,24 @@ class RSSIngestionService:
             if item:
                 items.append(item)
         items.sort(key=lambda x: x["published_date"], reverse=True)  # newest first
-        logger.info(f"NVD {label}: parsed {len(items)} CVEs")
+        logger.info(f"NVD {label}: {len(items)} CVEs in last {days}d")
         return items
 
     @staticmethod
-    def fetch_nvd_by_keyword(keyword: str, max_results: int = 40):
-        """Newest CVEs matching a vendor keyword (space-separated terms are
-        AND-matched by NVD). Good for distinctive vendor tokens like 'ivanti'."""
+    def fetch_nvd_by_keyword(keyword: str, days: int = 30):
+        """CVEs from the last `days` days matching a vendor keyword (space-separated
+        terms are AND-matched by NVD)."""
         return RSSIngestionService._fetch_nvd_paged(
-            f"keywordSearch={urllib.parse.quote(keyword)}", f"keyword '{keyword}'", max_results)
+            f"keywordSearch={urllib.parse.quote(keyword)}", f"keyword '{keyword}'", days)
 
     @staticmethod
-    def fetch_nvd_by_cpe(cpe_match: str, max_results: int = 40):
-        """Newest CVEs whose CPE matches a vendor, e.g.
-        'cpe:2.3:*:f5:*:*:*:*:*:*:*:*:*'. Zero-noise and covers every product
-        under that vendor — used for F5 and MobileIron, whose bare keyword search
-        is either too noisy ('f5' matches unrelated text) or too narrow."""
+    def fetch_nvd_by_cpe(cpe_match: str, days: int = 30):
+        """CVEs from the last `days` days whose CPE matches a vendor/product, e.g.
+        'cpe:2.3:*:f5:*:*:*:*:*:*:*:*:*'. Because it's a product+date filter every
+        result is an NVD-analysed CVE with a real CPE-derived vendor/product —
+        correctly labelled with no heuristics. Used for F5 / Ivanti / MobileIron."""
         return RSSIngestionService._fetch_nvd_paged(
-            f"virtualMatchString={urllib.parse.quote(cpe_match)}", f"cpe '{cpe_match}'", max_results)
+            f"virtualMatchString={urllib.parse.quote(cpe_match)}", f"cpe '{cpe_match}'", days)
 
     @staticmethod
     def fetch_splunk_advisories(max_advisories: int = 60):

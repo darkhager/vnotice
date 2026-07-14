@@ -384,18 +384,22 @@ def _infer_vendor_product(feed_name: str, title: str):
     return "Various", "Various"
 
 
-async def _evaluate_triggers(user_id: str, db_url: str = ""):
-    """After a sync, check if any new CVEs match the user's notification triggers
-    and fire alerts on the configured channels. Runs as a background task."""
+async def _evaluate_triggers(user_id: str = "", db_url: str = ""):
+    """After a sync, check if any new CVEs match users' notification triggers and
+    fire alerts on the configured channels. Runs as a background task.
+
+    An empty user_id means "every user that has triggers". The hourly auto-sync
+    authenticates as the auto-sync@vnotice.local service account, which owns no
+    triggers, so scoping this to the syncing user would never alert anybody.
+    """
     import logging as _log
     _logger = _log.getLogger(__name__)
     db = SessionLocal()
     try:
-        cfg = db.query(models.UserConfig).filter(models.UserConfig.user_id == user_id).first()
-        triggers = db.query(models.NotificationTrigger).filter(
-            models.NotificationTrigger.user_id == user_id
-        ).all()
-        if not triggers or not cfg:
+        uids = [user_id] if user_id else [
+            str(r[0]) for r in db.query(models.NotificationTrigger.user_id).distinct().all()
+        ]
+        if not uids:
             return
 
         # Only look at CVEs added in the last 10 minutes
@@ -403,81 +407,100 @@ async def _evaluate_triggers(user_id: str, db_url: str = ""):
         recent_cves = db.query(models.CVE).filter(
             models.CVE.created_at >= recent_cutoff
         ).all()
+        if not recent_cves:
+            return
 
-        for cve in recent_cves:
-            for trigger in triggers:
-                matched = True
-                if trigger.keyword and trigger.keyword.lower() not in (
-                    (cve.title or "") + " " + (cve.description or "")
-                ).lower():
-                    matched = False
-                if trigger.vendor and trigger.vendor.lower() not in (cve.vendor or "").lower():
-                    matched = False
-                if trigger.product and trigger.product.lower() not in (cve.product or "").lower():
-                    matched = False
-                if trigger.min_severity:
-                    if _SEVERITY_ORDER.get((cve.severity or "").lower(), 0) < \
-                       _SEVERITY_ORDER.get(trigger.min_severity.lower(), 0):
-                        matched = False
-                if trigger.min_cvss_score is not None:
-                    if (cve.cvss_score or 0) < float(trigger.min_cvss_score):
-                        matched = False
-                if not matched:
-                    continue
-
-                # Fire on every enabled channel
-                alert_kwargs = dict(
-                    title=cve.title or cve.cve_id,
-                    severity=cve.severity or "Medium",
-                    cve_id=cve.cve_id,
-                    description=(cve.description or "")[:300],
-                    reference_url=cve.reference_url,
-                )
-                try:
-                    async with httpx.AsyncClient(timeout=10.0) as client:
-                        if cfg.notify_teams and cfg.teams_webhook:
-                            payload = _build_teams_card(**alert_kwargs)
-                            await client.post(cfg.teams_webhook, json=payload)
-                        if cfg.notify_discord and cfg.discord_webhook:
-                            payload = _build_discord_payload(**alert_kwargs)
-                            await client.post(cfg.discord_webhook, json=payload)
-                        if cfg.notify_telegram and cfg.telegram_bot_token and cfg.telegram_chat_id:
-                            text_body = _build_telegram_text(**alert_kwargs)
-                            await client.post(
-                                f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
-                                json={"chat_id": cfg.telegram_chat_id, "text": text_body, "parse_mode": "HTML"},
-                            )
-                        if cfg.notify_line and cfg.line_channel_token:
-                            await client.post(
-                                "https://api.line.me/v2/bot/message/broadcast",
-                                headers={"Authorization": f"Bearer {cfg.line_channel_token}"},
-                                json={"messages": [{"type": "text", "text": _build_line_text(**alert_kwargs)}]},
-                            )
-                        if (cfg.notify_email and cfg.smtp_host and cfg.smtp_username
-                                and cfg.smtp_password and cfg.smtp_to_address):
-                            sev = (cve.severity or "Medium").upper()
-                            ref = cve.reference_url or ""
-                            desc = (cve.description or "")[:300]
-                            subject = f"[Vnotice Alert] {cve.cve_id} — {sev}"
-                            body = (
-                                '<html><body style="font-family:sans-serif">'
-                                f'<h2 style="color:#c0392b">🚨 CVE Alert: {cve.cve_id}</h2><table>'
-                                f'<tr><td><b>Title</b></td><td>{cve.title or cve.cve_id}</td></tr>'
-                                f'<tr><td><b>Severity</b></td><td>{sev}</td></tr>'
-                                + (f'<tr><td><b>Description</b></td><td>{desc}</td></tr>' if desc else '')
-                                + (f'<tr><td><b>Reference</b></td><td><a href="{ref}">{ref}</a></td></tr>' if ref else '')
-                                + '</table></body></html>'
-                            )
-                            # _send_smtp is blocking — run it off the event loop.
-                            await asyncio.get_event_loop().run_in_executor(
-                                None, _send_smtp, cfg.smtp_host, cfg.smtp_port or 587,
-                                cfg.smtp_username, cfg.smtp_password, cfg.smtp_to_address,
-                                subject, body,
-                            )
-                except Exception as exc:
-                    _logger.error(f"Trigger alert failed for {cve.cve_id}: {exc}")
+        for uid in uids:
+            await _evaluate_user_triggers(db, uid, recent_cves, _logger)
     finally:
         db.close()
+
+
+async def _evaluate_user_triggers(db, user_id, recent_cves, _logger):
+    """Match `recent_cves` against one user's triggers and alert on every hit."""
+    cfg = db.query(models.UserConfig).filter(models.UserConfig.user_id == user_id).first()
+    triggers = db.query(models.NotificationTrigger).filter(
+        models.NotificationTrigger.user_id == user_id
+    ).all()
+    if not triggers or not cfg:
+        return
+
+    for cve in recent_cves:
+        for trigger in triggers:
+            matched = True
+            if trigger.keyword and trigger.keyword.lower() not in (
+                (cve.title or "") + " " + (cve.description or "")
+            ).lower():
+                matched = False
+            if trigger.vendor and trigger.vendor.lower() not in (cve.vendor or "").lower():
+                matched = False
+            if trigger.product and trigger.product.lower() not in (cve.product or "").lower():
+                matched = False
+            if trigger.feed_source and trigger.feed_source.strip().lower() != (
+                cve.rss_source or ""
+            ).strip().lower():
+                matched = False
+            if trigger.min_severity:
+                if _SEVERITY_ORDER.get((cve.severity or "").lower(), 0) < \
+                   _SEVERITY_ORDER.get(trigger.min_severity.lower(), 0):
+                    matched = False
+            if trigger.min_cvss_score is not None:
+                if (cve.cvss_score or 0) < float(trigger.min_cvss_score):
+                    matched = False
+            if not matched:
+                continue
+
+            # Fire on every enabled channel
+            alert_kwargs = dict(
+                title=cve.title or cve.cve_id,
+                severity=cve.severity or "Medium",
+                cve_id=cve.cve_id,
+                description=(cve.description or "")[:300],
+                reference_url=cve.reference_url,
+            )
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    if cfg.notify_teams and cfg.teams_webhook:
+                        payload = _build_teams_card(**alert_kwargs)
+                        await client.post(cfg.teams_webhook, json=payload)
+                    if cfg.notify_discord and cfg.discord_webhook:
+                        payload = _build_discord_payload(**alert_kwargs)
+                        await client.post(cfg.discord_webhook, json=payload)
+                    if cfg.notify_telegram and cfg.telegram_bot_token and cfg.telegram_chat_id:
+                        text_body = _build_telegram_text(**alert_kwargs)
+                        await client.post(
+                            f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
+                            json={"chat_id": cfg.telegram_chat_id, "text": text_body, "parse_mode": "HTML"},
+                        )
+                    if cfg.notify_line and cfg.line_channel_token:
+                        await client.post(
+                            "https://api.line.me/v2/bot/message/broadcast",
+                            headers={"Authorization": f"Bearer {cfg.line_channel_token}"},
+                            json={"messages": [{"type": "text", "text": _build_line_text(**alert_kwargs)}]},
+                        )
+                    if (cfg.notify_email and cfg.smtp_host and cfg.smtp_username
+                            and cfg.smtp_password and cfg.smtp_to_address):
+                        sev = (cve.severity or "Medium").upper()
+                        ref = cve.reference_url or ""
+                        desc = (cve.description or "")[:300]
+                        subject = f"[Vnotice Alert] {cve.cve_id} — {sev}"
+                        body = (
+                            '<html><body style="font-family:sans-serif">'
+                            f'<h2 style="color:#c0392b">🚨 CVE Alert: {cve.cve_id}</h2><table>'
+                            f'<tr><td><b>Title</b></td><td>{cve.title or cve.cve_id}</td></tr>'
+                            f'<tr><td><b>Severity</b></td><td>{sev}</td></tr>'
+                            + (f'<tr><td><b>Description</b></td><td>{desc}</td></tr>' if desc else '')
+                            + (f'<tr><td><b>Reference</b></td><td><a href="{ref}">{ref}</a></td></tr>' if ref else '')
+                            + '</table></body></html>'
+                        )
+                        # _send_smtp is blocking — run it off the event loop.
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, _send_smtp, cfg.smtp_host, cfg.smtp_port or 587,
+                            cfg.smtp_username, cfg.smtp_password, cfg.smtp_to_address,
+                            subject, body,
+                        )
+            except Exception as exc:
+                _logger.error(f"Trigger alert failed for {cve.cve_id}: {exc}")
 
 
 @app.post("/sync/", response_model=schemas.SyncResponse)
@@ -490,7 +513,11 @@ def sync_threat_sources(
     feeds_checked = 0
     scrapers_checked = 0
     new_cves_added = 0
-    two_years_ago = datetime.utcnow() - timedelta(days=730)
+    # Retention window: only ever store CVEs published in the last 30 days.
+    # Enforced twice -- skipped on ingest below, and swept from the table
+    # near the end of this function so it also catches rows that have aged
+    # out since they were inserted (every sync run re-checks published_date).
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
 
     # Preload existing keys once. Previously each parsed CVE triggered its own
     # SELECT (N+1 — hundreds of round-trips per sync); now it's a single query
@@ -512,6 +539,11 @@ def sync_threat_sources(
             key = (item["cve_id"], source_name)
             if key in existing_pairs:
                 continue
+            pub = item.get("published_date")
+            if pub:
+                pub_naive = pub.replace(tzinfo=None) if getattr(pub, "tzinfo", None) else pub
+                if pub_naive < thirty_days_ago:
+                    continue
             item["keywords"] = RSSIngestionService.extract_keywords(
                 item.get("title", ""), item.get("description", ""),
                 item.get("vendor", ""), item.get("product", ""))
@@ -586,11 +618,11 @@ def sync_threat_sources(
         # Standard XML / RSS / Atom ingestion
         parsed_cves = RSSIngestionService.fetch_and_parse_rss(feed.url)
         for item in parsed_cves:
-            # Skip items older than 2 years
+            # Skip items older than the retention window
             pub = item.get("published_date")
             if pub:
                 pub_naive = pub.replace(tzinfo=None) if getattr(pub, "tzinfo", None) else pub
-                if pub_naive < two_years_ago:
+                if pub_naive < thirty_days_ago:
                     continue
             key = (item["cve_id"], feed.name)
             if key not in existing_pairs:
@@ -657,6 +689,16 @@ def sync_threat_sources(
     for src, recs in synced_by_source.items():
         source_store.write_source(src, recs)
 
+    # Retention sweep: every sync (hourly, via the autosync timer) re-checks
+    # published_date on the whole table and drops anything that has aged past
+    # the 30-day window -- not just what this run touched.
+    purged = db.query(models.CVE).filter(
+        models.CVE.published_date < thirty_days_ago
+    ).delete(synchronize_session=False)
+    if purged:
+        logger.warning(f"retention sweep: purged {purged} CVE(s) older than 30 days")
+        _CVES_CACHE.clear()
+
     # Persist feed/scraper config to UserConfig so other clients can load it
     cfg = _get_or_create_config(current_user, db)
     cfg.feeds_config = [f.model_dump() for f in sync_req.feeds]
@@ -669,9 +711,11 @@ def sync_threat_sources(
         raise HTTPException(status_code=500, detail=f"Database transaction error: {e}")
     _CVES_CACHE.clear()   # ponytail: new CVEs written ⇒ drop the /cves/ response cache
 
-    # Evaluate notification triggers against newly added CVEs (background, non-blocking)
+    # Evaluate notification triggers against newly added CVEs (background, non-blocking).
+    # Empty user_id => every user with triggers; the caller is normally the auto-sync
+    # service account, which owns none of them.
     if new_cves_added > 0:
-        background_tasks.add_task(_evaluate_triggers, str(current_user.id), str(engine.url))
+        background_tasks.add_task(_evaluate_triggers, "", str(engine.url))
 
     return schemas.SyncResponse(
         status="success",

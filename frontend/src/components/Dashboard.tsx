@@ -602,6 +602,7 @@ export default function Dashboard() {
         "tools.cisco.com/security/center/rss",  // returns HTML page, not RSS
         "support.f5.com/csp/feed",              // returns HTML login page
         "keywordsearch=f5+big-ip",              // narrow F5 feed superseded by CPE-vendor F5 (all products)
+        "keywordsearch=ivanti",                 // Ivanti switched to CPE product filter (uniform product+date query)
         "vulners.com/rss.xml",                  // feed returns nothing usable
         "seclists.org/rss/fulldisclosure.rss",  // Full Disclosure — feed returns nothing usable
       ];
@@ -618,10 +619,10 @@ export default function Dashboard() {
         { name: "Rocky Linux",       url: "https://apollo.build.resf.org/api/v3/advisories/",     active: true },
         { name: "Microsoft (Windows)", url: "https://api.msrc.microsoft.com/cvrf/v3.0/updates",   active: true },
         // F5 / MobileIron / Ivanti: sites unscrapeable (SPA/JS) — pulled from NVD.
-        // F5 & MobileIron by CPE vendor (all products, zero noise); Ivanti by keyword.
+        // All three by CPE vendor + last-30-days window (all products, zero noise, real labels).
         { name: "F5",                url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:f5:*:*:*:*:*:*:*:*:*", active: true },
         { name: "MobileIron",        url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:mobileiron:*:*:*:*:*:*:*:*:*", active: true },
-        { name: "Ivanti",            url: "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=ivanti", active: true },
+        { name: "Ivanti",            url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:ivanti:*:*:*:*:*:*:*:*:*", active: true },
         { name: "Ubuntu Security",   url: "https://ubuntu.com/security/notices/rss.xml",          active: true },
         { name: "CERT.PL Security",  url: "https://cert.pl/en/rss.xml",                          active: true },
       ];
@@ -645,10 +646,10 @@ export default function Dashboard() {
         // Check Point advisories — JSON API (SPA page can't be scraped) for real severity/CVSS
         { name: "Check Point Advisories", url: "https://support.checkpoint.com/security-advisories", active: true },
         // F5 / MobileIron / Ivanti — own sites unscrapeable (Salesforce SPA / JS blog); pulled from NVD.
-        // F5 & MobileIron by CPE vendor (all products, zero noise); Ivanti by distinctive keyword.
+        // All three by CPE vendor + last-30-days window (all products, zero noise, real labels).
         { name: "F5", url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:f5:*:*:*:*:*:*:*:*:*", active: true },
         { name: "MobileIron", url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:mobileiron:*:*:*:*:*:*:*:*:*", active: true },
-        { name: "Ivanti", url: "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=ivanti", active: true },
+        { name: "Ivanti", url: "https://services.nvd.nist.gov/rest/json/cves/2.0?virtualMatchString=cpe:2.3:*:ivanti:*:*:*:*:*:*:*:*:*", active: true },
         // OS / distro security
         { name: "Ubuntu Security", url: "https://ubuntu.com/security/notices/rss.xml", active: true },
         // Red Hat Security Data API (JSON) — real CVSS/severity
@@ -1999,36 +2000,15 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                {/* Time window — default last 30 days (lighter payload); View all loads everything */}
-                <div className="space-y-2 pt-2.5 border-t border-white/5">
+                {/* Retention is enforced server-side (purged nightly on sync), so there's
+                    nothing to toggle here anymore — just explain the window. */}
+                <div className="space-y-1.5 pt-2.5 border-t border-white/5">
                   <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-                    Time Window
+                    Data Retention
                   </span>
-                  <div className="flex gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setTimeWindowDays(30)}
-                      className={`flex-1 px-2 py-1.5 text-[0.72em] font-bold rounded-lg border transition ${
-                        timeWindowDays === 30
-                          ? "bg-sky-500/20 border-sky-500/40 text-sky-300"
-                          : "bg-white/[0.02] border-white/10 text-gray-400 hover:text-white"
-                      }`}
-                    >
-                      Last 30 days
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setTimeWindowDays(null)}
-                      title="Loads every CVE — heavier on resources"
-                      className={`flex-1 px-2 py-1.5 text-[0.72em] font-bold rounded-lg border transition ${
-                        timeWindowDays === null
-                          ? "bg-sky-500/20 border-sky-500/40 text-sky-300"
-                          : "bg-white/[0.02] border-white/10 text-gray-400 hover:text-white"
-                      }`}
-                    >
-                      View all
-                    </button>
-                  </div>
+                  <p className="text-[0.72em] text-gray-500 leading-relaxed">
+                    Showing CVEs published in the last 30 days. Older entries are purged automatically during each sync.
+                  </p>
                 </div>
 
                 {/* Reset button */}

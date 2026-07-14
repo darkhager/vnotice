@@ -165,6 +165,9 @@ class NotificationTrigger(Base):
     product = Column(String(100))
     min_severity = Column(String(20))
     min_cvss_score = Column(Numeric(3, 1))
+    # Exact cves.rss_source match; NULL = any source. Mirrors the UI's
+    # "feed sources" alert criterion, which none of the columns above can express.
+    feed_source = Column(String(120))
     created_at = Column(DateTime(timezone=True), server_default=text('CURRENT_TIMESTAMP'))
 
     user = relationship("User", back_populates="triggers")
