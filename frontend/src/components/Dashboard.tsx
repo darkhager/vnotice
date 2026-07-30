@@ -1476,6 +1476,7 @@ export default function Dashboard() {
           smtp_username: smtpUsername, smtp_password: smtpPassword, to_address: email,
           cve_id: v.id, title: v.name || v.id, severity: v.severity || "Medium",
           description: v.description || "", reference_url: v.url || "",
+          epss: v.epss ?? null,
         }),
       });
       const data = await r.json().catch(() => ({}));

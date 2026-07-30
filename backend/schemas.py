@@ -163,6 +163,7 @@ class NotifAlertRequest(BaseModel):
     cve_id: str
     description: Optional[str] = None
     reference_url: Optional[str] = None
+    epss: Optional[float] = None
 
 # Teams
 class TeamsAlertRequest(NotifAlertRequest):
@@ -216,6 +217,7 @@ class EmailTestRequest(BaseModel):
     severity: Optional[str] = None
     description: Optional[str] = None
     reference_url: Optional[str] = None
+    epss: Optional[float] = None
 
 # SMS (Twilio)
 class SmsAlertRequest(NotifAlertRequest):
