@@ -343,7 +343,7 @@ export default function Dashboard() {
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
   
   // Navigation tabs state
-  const [activeTab, setActiveTab] = useState<"threat_dashboard" | "threat_stream" | "rss" | "alerts" | "settings">("threat_dashboard");
+  const [activeTab, setActiveTab] = useState<"threat_dashboard" | "threat_stream" | "rss" | "alerts" | "settings">("threat_stream");
   const [streamSyncMode, setStreamSyncMode] = useState<string>(() => {
     if (typeof window !== "undefined") {
       const saved = localStorage.getItem("vnotice_stream_sync_mode");
@@ -1681,16 +1681,6 @@ export default function Dashboard() {
         {/* Center: Navigation Tabs */}
         <nav className="hidden lg:flex items-center gap-1 bg-white/[0.015] p-1.5 rounded-2xl border border-white/5 shadow-inner backdrop-blur-xl">
           <button
-            onClick={() => setActiveTab("threat_dashboard")}
-            className={`px-4 py-2 rounded-xl text-[11px] font-bold uppercase tracking-wider transition-all duration-300 ${
-              activeTab === "threat_dashboard"
-                ? "bg-gradient-to-r from-sky-500 to-cyan-500 text-white font-extrabold shadow-[0_0_15px_rgba(14,165,233,0.3)] border border-sky-400/20 scale-[1.02]"
-                : "text-gray-400 hover:text-white hover:bg-white/[0.04] border border-transparent"
-            }`}
-          >
-            📊 Threat Dashboard
-          </button>
-          <button
             onClick={() => setActiveTab("threat_stream")}
             className={`px-4 py-2 rounded-xl text-[11px] font-bold uppercase tracking-wider transition-all duration-300 ${
               activeTab === "threat_stream"
@@ -1699,6 +1689,16 @@ export default function Dashboard() {
             }`}
           >
             🚨 Threat Stream
+          </button>
+          <button
+            onClick={() => setActiveTab("threat_dashboard")}
+            className={`px-4 py-2 rounded-xl text-[11px] font-bold uppercase tracking-wider transition-all duration-300 ${
+              activeTab === "threat_dashboard"
+                ? "bg-gradient-to-r from-sky-500 to-cyan-500 text-white font-extrabold shadow-[0_0_15px_rgba(14,165,233,0.3)] border border-sky-400/20 scale-[1.02]"
+                : "text-gray-400 hover:text-white hover:bg-white/[0.04] border border-transparent"
+            }`}
+          >
+            📊 Threat Dashboard
           </button>
           <button
             onClick={() => setActiveTab("rss")}
