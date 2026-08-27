@@ -458,6 +458,7 @@ async def _evaluate_user_triggers(db, user_id, recent_cves, _logger):
                 description=(cve.description or "")[:300],
                 reference_url=cve.reference_url,
                 epss=cve.epss,
+                cvss_score=cve.cvss_score,
             )
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
@@ -485,12 +486,14 @@ async def _evaluate_user_triggers(db, user_id, recent_cves, _logger):
                         ref = cve.reference_url or ""
                         desc = (cve.description or "")[:300]
                         epss_str = f"{cve.epss * 100:.2f}%" if cve.epss is not None else "N/A"
+                        cvss_str = f"{cve.cvss_score:.1f}" if cve.cvss_score is not None else "N/A"
                         subject = f"[Vnotice Alert] {cve.cve_id} — {sev}"
                         body = (
                             '<html><body style="font-family:sans-serif">'
                             f'<h2 style="color:#c0392b">🚨 CVE Alert: {cve.cve_id}</h2><table>'
                             f'<tr><td><b>Title</b></td><td>{cve.title or cve.cve_id}</td></tr>'
                             f'<tr><td><b>Severity</b></td><td>{sev}</td></tr>'
+                            f'<tr><td><b>CVSS</b></td><td>{cvss_str}</td></tr>'
                             f'<tr><td><b>EPSS</b></td><td>{epss_str}</td></tr>'
                             + (f'<tr><td><b>Description</b></td><td>{desc}</td></tr>' if desc else '')
                             + (f'<tr><td><b>Reference</b></td><td><a href="{ref}">{ref}</a></td></tr>' if ref else '')
@@ -975,14 +978,16 @@ def _validate_teams_webhook(url: str) -> None:
 
 def _build_teams_card(title: str, severity: str, cve_id: str,
                       description: Optional[str], reference_url: Optional[str],
-                      epss: Optional[float] = None) -> dict:
+                      epss: Optional[float] = None, cvss_score: Optional[float] = None) -> dict:
     # The Teams Workflow ("Post card when a webhook request is received") requires
     # an Adaptive Card wrapped in the attachments envelope below — a plain
     # {"text": ...} body is accepted at HTTP level (202) but the flow then fails
     # to post it. So we always send a proper Adaptive Card.
     color_map = {"critical": "attention", "high": "warning", "medium": "accent", "low": "good"}
     color = color_map.get((severity or "").lower(), "default")
-    facts = [{"title": "Severity", "value": severity}, {"title": "CVE ID", "value": cve_id}]
+    facts = [{"title": "CVE ID", "value": cve_id}, {"title": "Severity", "value": severity}]
+    if cvss_score is not None:
+        facts.append({"title": "CVSS", "value": f"{cvss_score:.1f}"})
     if epss is not None:
         facts.append({"title": "EPSS", "value": f"{epss * 100:.2f}%"})
     body = [{"type": "TextBlock", "text": f"🚨 {title}", "weight": "bolder",
@@ -1014,7 +1019,7 @@ async def send_teams_alert(req: schemas.TeamsAlertRequest):
     """Send a CVE alert to a Microsoft Teams channel via Incoming Webhook."""
     _validate_teams_webhook(req.webhook_url)
     payload = _build_teams_card(req.title, req.severity, req.cve_id,
-                                req.description, req.reference_url, req.epss)
+                                req.description, req.reference_url, req.epss, req.cvss_score)
     last_error = ""
     for attempt in range(1, 4):
         try:
@@ -1073,7 +1078,7 @@ _DISCORD_COLOR = {"critical": 15158332, "high": 16744272, "medium": 16776960, "l
 
 def _build_discord_payload(title: str, severity: str, cve_id: str,
                            description: Optional[str], reference_url: Optional[str],
-                           epss: Optional[float] = None) -> dict:
+                           epss: Optional[float] = None, cvss_score: Optional[float] = None) -> dict:
     color = _DISCORD_COLOR.get(severity.lower(), 9807270)
     embed: dict = {
         "title": f"[{cve_id}] {title}",
@@ -1135,7 +1140,7 @@ async def test_discord_webhook(
 
 def _build_telegram_text(title: str, severity: str, cve_id: str,
                           description: Optional[str], reference_url: Optional[str],
-                          epss: Optional[float] = None) -> str:
+                          epss: Optional[float] = None, cvss_score: Optional[float] = None) -> str:
     lines = [
         f"<b>🚨 [{cve_id}]</b> {title}",
         f"Severity: <b>{severity.upper()}</b>",
@@ -1169,7 +1174,7 @@ async def send_telegram_alert(
 
 def _build_line_text(title: str, severity: str, cve_id: str,
                      description: Optional[str], reference_url: Optional[str],
-                     epss: Optional[float] = None) -> str:
+                     epss: Optional[float] = None, cvss_score: Optional[float] = None) -> str:
     # LINE text messages are plain text (no HTML), 5000-char limit.
     lines = [f"🚨 [{cve_id}] {title}", f"Severity: {severity.upper()}"]
     if description:
@@ -1275,11 +1280,13 @@ async def send_email_alert(
 ):
     subject = f"[Vnotice Alert] {req.cve_id} — {req.severity.upper()}"
     epss_str = f"{req.epss * 100:.2f}%" if req.epss is not None else "N/A"
+    cvss_str = f"{req.cvss_score:.1f}" if req.cvss_score is not None else "N/A"
     body = f"""
 <html><body style="font-family:sans-serif">
 <h2 style="color:#c0392b">🚨 CVE Alert: {req.cve_id}</h2>
 <table><tr><td><b>Title</b></td><td>{req.title}</td></tr>
 <tr><td><b>Severity</b></td><td>{req.severity.upper()}</td></tr>
+<tr><td><b>CVSS</b></td><td>{cvss_str}</td></tr>
 <tr><td><b>EPSS</b></td><td>{epss_str}</td></tr>
 {'<tr><td><b>Description</b></td><td>' + (req.description or '') + '</td></tr>' if req.description else ''}
 {'<tr><td><b>Reference</b></td><td><a href="' + req.reference_url + '">' + req.reference_url + '</a></td></tr>' if req.reference_url else ''}
@@ -1307,12 +1314,14 @@ async def test_email_config(
         # ponytail: a CVE was supplied → send the real alert body (per-alert "send latest match").
         sev = (req.severity or "Medium").upper()
         epss_str = f"{req.epss * 100:.2f}%" if req.epss is not None else "N/A"
+        cvss_str = f"{req.cvss_score:.1f}" if req.cvss_score is not None else "N/A"
         subject = f"[Vnotice Alert] {req.cve_id} — {sev}"
         body = (
             '<html><body style="font-family:sans-serif">'
             f'<h2 style="color:#c0392b">🚨 CVE Alert: {req.cve_id}</h2><table>'
             f'<tr><td><b>Title</b></td><td>{req.title or req.cve_id}</td></tr>'
             f'<tr><td><b>Severity</b></td><td>{sev}</td></tr>'
+            f'<tr><td><b>CVSS</b></td><td>{cvss_str}</td></tr>'
             f'<tr><td><b>EPSS</b></td><td>{epss_str}</td></tr>'
             + (f'<tr><td><b>Description</b></td><td>{req.description}</td></tr>' if req.description else '')
             + (f'<tr><td><b>Reference</b></td><td><a href="{req.reference_url}">{req.reference_url}</a></td></tr>' if req.reference_url else '')
@@ -1397,7 +1406,7 @@ def create_trigger(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    if not any([trigger.keyword, trigger.vendor, trigger.product,
+    if not any([trigger.keyword, trigger.vendor, trigger.product, trigger.feed_source,
                 trigger.min_severity, trigger.min_cvss_score is not None]):
         raise HTTPException(status_code=422, detail="At least one trigger condition is required.")
     row = models.NotificationTrigger(
@@ -1407,6 +1416,7 @@ def create_trigger(
         product=trigger.product,
         min_severity=trigger.min_severity,
         min_cvss_score=trigger.min_cvss_score,
+        feed_source=trigger.feed_source,
     )
     db.add(row)
     db.commit()

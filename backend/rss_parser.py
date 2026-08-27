@@ -27,30 +27,47 @@ _KW_STOPWORDS = {
 }
 
 
-def parse_date(date_str: str):
+_RSS_DATE_FORMATS = (
+    '%a, %d %b %Y %H:%M:%S %Z',
+    '%a, %d %b %Y %H:%M:%S %z',
+    '%a, %d %b %Y %H:%M:%S',
+    '%Y-%m-%dT%H:%M:%S.%fZ',     # ISO with millis + Z (e.g. Palo Alto: 2026-06-13T01:45:00.000Z)
+    '%Y-%m-%dT%H:%M:%S.%f%z',    # ISO with millis + offset (e.g. Rocky: ...155864+00:00)
+    '%Y-%m-%dT%H:%M:%S.%f',
+    '%Y-%m-%dT%H:%M:%S%z',
+    '%Y-%m-%dT%H:%M:%SZ',
+    '%Y-%m-%d %H:%M:%S'
+)
+
+
+def _try_parse_rss_date(date_str: str) -> Optional[datetime]:
+    """Try each known RSS date format; return None (not "now") if none match."""
     if not date_str:
-        return datetime.utcnow()
-    # Try a few common RSS date formats
-    for fmt in (
-        '%a, %d %b %Y %H:%M:%S %Z',
-        '%a, %d %b %Y %H:%M:%S %z',
-        '%a, %d %b %Y %H:%M:%S',
-        '%Y-%m-%dT%H:%M:%S.%fZ',     # ISO with millis + Z (e.g. Palo Alto: 2026-06-13T01:45:00.000Z)
-        '%Y-%m-%dT%H:%M:%S.%f%z',    # ISO with millis + offset (e.g. Rocky: ...155864+00:00)
-        '%Y-%m-%dT%H:%M:%S.%f',
-        '%Y-%m-%dT%H:%M:%S%z',
-        '%Y-%m-%dT%H:%M:%SZ',
-        '%Y-%m-%d %H:%M:%S'
-    ):
+        return None
+    clean_str = date_str.strip()
+    # Strip timezone names strptime doesn't understand (e.g. GMT).
+    if clean_str.endswith(' GMT'):
+        clean_str = clean_str[:-4] + ' +0000'
+    for fmt in _RSS_DATE_FORMATS:
         try:
-            # Strip timezone names if strptime doesn't like it (e.g. GMT)
-            clean_str = date_str.strip()
-            if clean_str.endswith(' GMT'):
-                clean_str = clean_str[:-4] + ' +0000'
             return datetime.strptime(clean_str, fmt)
         except ValueError:
             pass
-    return datetime.utcnow()
+    return None
+
+
+def parse_date(date_str: str):
+    # Lenient: most feeds have no per-item date-quality signal to act on, so a
+    # bad/missing date defaults to "now" rather than dropping the item.
+    return _try_parse_rss_date(date_str) or datetime.utcnow()
+
+
+def _parse_paloalto_date(date_str: str) -> Optional[datetime]:
+    # Strict: unlike parse_date(), returns None instead of "now" on failure so
+    # the caller can skip the item rather than mislabel an old advisory as
+    # freshly-published (which would let it slip past the 30-day retention
+    # filter and fire a false "new CVE" alert).
+    return _try_parse_rss_date(date_str)
 
 class RSSIngestionService:
     @staticmethod
@@ -651,7 +668,17 @@ class RSSIngestionService:
         for item in root.findall(".//item"):
             title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "").strip()
-            pub = item.findtext("pubDate") or ""
+            pub = (item.findtext("pubDate") or "").strip()
+
+            # parse_date() silently falls back to "now" for anything it can't
+            # match, which would stamp an old advisory as freshly-published --
+            # letting it slip past the 30-day retention filter and fire a
+            # "new CVE" alert for something that's actually old news. Skip the
+            # item instead of mislabeling its date.
+            published_date = _parse_paloalto_date(pub)
+            if published_date is None:
+                logger.warning(f"Palo Alto advisory has unparseable/missing pubDate {pub!r}, skipping: {title[:80]}")
+                continue
 
             m = re.search(r"CVE-\d{4}-\d+", title)
             if m:
@@ -683,7 +710,7 @@ class RSSIngestionService:
                 "vendor":         "Palo Alto Networks",
                 "product":        product,
                 "reference_url":  link or "https://security.paloaltonetworks.com/",
-                "published_date": parse_date(pub),
+                "published_date": published_date,
             })
             if len(items) >= max_advisories:
                 break

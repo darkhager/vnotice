@@ -190,6 +190,18 @@ function inferVendorProduct(src: string, title: string): [string, string] | null
 }
 
 /** Map a raw backend CVE object to the frontend vulnerability shape. */
+// Days take priority once uptime crosses 24h -- "19744m 31s" / "329h 4m" style
+// output is unreadable for anything that's been up more than an hour or two.
+function formatUptime(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds || 0));
+  const days = Math.floor(s / 86400);
+  const hours = Math.floor((s % 86400) / 3600);
+  const minutes = Math.floor((s % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m ${s % 60}s`;
+}
+
 function mapApiCve(c: any) {
   const rawVendor  = c.vendor  || "";
   const rawProduct = c.product || "";
@@ -481,6 +493,16 @@ export default function Dashboard() {
   const [emailAlertsEnabled, setEmailAlertsEnabled] = useState(true);
   const [profileSaved, setProfileSaved] = useState(false);
 
+  // Server-side alert account: links this profile to a real backend User so the
+  // hourly auto-sync job can actually send its Teams/email alerts (previously
+  // only setup_alerts.py / setup_teams_alert.py, run by hand over SSH, could do this).
+  const [authPassword, setAuthPassword] = useState("");
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authMsg, setAuthMsg] = useState("");
+  const [selectedFeedSources, setSelectedFeedSources] = useState<string[]>([]);
+  const [existingTriggerIds, setExistingTriggerIds] = useState<Record<string, string>>({});
+
   // Feed Add/Edit Validation popup states
   const [isFeedModalOpen, setIsFeedModalOpen] = useState(false);
   const [feedModalMode, setFeedModalMode] = useState<"add" | "edit">("add");
@@ -514,6 +536,142 @@ export default function Dashboard() {
     }
     window.alert(msg);
     appendLog(`[NET] Test ${label}: ${msg}`);
+  };
+
+  // --- Server-side alert account: self-service login/register + save. ---
+  const authHeaders = (): Record<string, string> =>
+    authToken ? { Authorization: `Bearer ${authToken}` } : {};
+
+  const handleAuthLink = async () => {
+    if (!email.trim() || !authPassword.trim()) {
+      window.alert("Enter your email and an account password first.");
+      return;
+    }
+    setAuthBusy(true);
+    setAuthMsg("");
+    try {
+      const base = getApiBase();
+      const form = new URLSearchParams({ username: email.trim(), password: authPassword });
+      let r = await fetch(`${base}/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: form,
+      });
+      if (r.status === 401) {
+        // No account yet with this password -- register, then log in.
+        const reg = await fetch(`${base}/users/`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: email.trim(), password: authPassword, username: displayName || undefined }),
+        });
+        if (reg.ok) {
+          r = await fetch(`${base}/token`, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: form,
+          });
+        } else if (reg.status !== 400) {
+          // 400 = "Email already registered" -- means the password was just wrong; fall through to the original 401.
+          const d = await reg.json().catch(() => ({}));
+          throw new Error(typeof d.detail === "string" ? d.detail : "Could not create account.");
+        }
+      }
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        throw new Error(typeof d.detail === "string" ? d.detail : "Login failed -- check the password.");
+      }
+      const data = await r.json();
+      setAuthToken(data.access_token);
+      if (activeProfileId) localStorage.setItem(`vnotice_auth_token_${activeProfileId}`, data.access_token);
+      setAuthPassword("");
+      setAuthMsg(`✓ Linked as ${email.trim()}`);
+      appendLog(`[NET] Linked alert account for ${email.trim()}`);
+    } catch (e) {
+      setAuthMsg(`✗ ${e instanceof Error ? e.message : "Login failed"}`);
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleAuthUnlink = () => {
+    setAuthToken(null);
+    if (activeProfileId) localStorage.removeItem(`vnotice_auth_token_${activeProfileId}`);
+    setExistingTriggerIds({});
+    setSelectedFeedSources([]);
+    setAuthMsg("");
+  };
+
+  const loadTriggers = async (token: string) => {
+    try {
+      const base = getApiBase();
+      const r = await fetch(`${base}/triggers/`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!r.ok) return;
+      const rows: any[] = await r.json();
+      const map: Record<string, string> = {};
+      rows.forEach((t) => { if (t.feed_source) map[t.feed_source] = t.id; });
+      setExistingTriggerIds(map);
+      setSelectedFeedSources(Object.keys(map));
+    } catch { /* non-fatal -- panel just shows nothing pre-selected */ }
+  };
+
+  useEffect(() => {
+    if (authToken) loadTriggers(authToken);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authToken]);
+
+  // One button saves both the channel config (email/Teams) and this
+  // account's feed-source subscriptions in one go.
+  const handleSaveServerAlertSettings = async () => {
+    if (!authToken) {
+      window.alert("Link your account first, then save.");
+      return;
+    }
+    setAuthBusy(true);
+    setAuthMsg("");
+    try {
+      const base = getApiBase();
+      const cfgBody: Record<string, unknown> = {
+        notify_email: emailAlertsEnabled,
+        notify_teams: teamsAlertsEnabled,
+      };
+      if (smtpHost.trim()) cfgBody.smtp_host = smtpHost.trim();
+      if (smtpPort.trim()) cfgBody.smtp_port = parseInt(smtpPort) || 587;
+      if (smtpUsername.trim()) cfgBody.smtp_username = smtpUsername.trim();
+      if (smtpPassword.trim()) cfgBody.smtp_password = smtpPassword;
+      if (email.trim()) cfgBody.smtp_to_address = email.trim();
+      if (teamsWebhookUrl.trim()) cfgBody.teams_webhook = teamsWebhookUrl.trim();
+
+      const cfgRes = await fetch(`${base}/users/me/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify(cfgBody),
+      });
+      if (!cfgRes.ok) {
+        const d = await cfgRes.json().catch(() => ({}));
+        throw new Error(typeof d.detail === "string" ? d.detail : `Config save failed (HTTP ${cfgRes.status})`);
+      }
+
+      const toAdd = selectedFeedSources.filter((s) => !existingTriggerIds[s]);
+      const toRemove = Object.entries(existingTriggerIds).filter(([s]) => !selectedFeedSources.includes(s));
+      for (const src of toAdd) {
+        await fetch(`${base}/triggers/`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          body: JSON.stringify({ feed_source: src, min_cvss_score: 0 }),
+        });
+      }
+      for (const [, id] of toRemove) {
+        await fetch(`${base}/triggers/${id}`, { method: "DELETE", headers: authHeaders() });
+      }
+      await loadTriggers(authToken);
+
+      setAuthMsg("✓ Saved to server -- alerts will fire on the next hourly sync.");
+      appendLog("[NET] Saved server-side alert config + feed subscriptions");
+    } catch (e) {
+      setAuthMsg(`✗ ${e instanceof Error ? e.message : "Save failed"}`);
+    } finally {
+      setAuthBusy(false);
+    }
   };
 
   // Initial load
@@ -850,6 +1008,13 @@ export default function Dashboard() {
     // Load this account's alert rules (or clear them on logout) — kept separate per account.
     setAlertRules(activeProfileId ? loadAlertRulesFor(activeProfileId) : []);
   }, [activeProfileId, activeProfile]);
+
+  // Restore this profile's server-alert-account session (if it linked one before).
+  useEffect(() => {
+    setAuthMsg("");
+    if (!activeProfileId) { setAuthToken(null); return; }
+    setAuthToken(localStorage.getItem(`vnotice_auth_token_${activeProfileId}`));
+  }, [activeProfileId]);
 
   const applyTheme = (theme: "dark" | "light") => {
     if (theme === "light") {
@@ -1476,7 +1641,7 @@ export default function Dashboard() {
           smtp_username: smtpUsername, smtp_password: smtpPassword, to_address: email,
           cve_id: v.id, title: v.name || v.id, severity: v.severity || "Medium",
           description: v.description || "", reference_url: v.url || "",
-          epss: v.epss ?? null,
+          epss: v.epss ?? null, cvss_score: v.score ?? null,
         }),
       });
       const data = await r.json().catch(() => ({}));
@@ -2444,6 +2609,76 @@ export default function Dashboard() {
               <p className="text-xs text-gray-400 mt-1">Configure SMTP servers, Microsoft Teams webhooks, and SMS parameters</p>
             </div>
 
+            {/* Link to Vnotice's server: the hourly auto-sync job reads from the
+                backend DB, not this browser, so the settings below only take
+                effect for real, unattended alerts once linked + saved here. */}
+            <div className="space-y-4 bg-sky-500/[0.04] p-5 rounded-xl border border-sky-500/15">
+              <div className="flex items-center justify-between gap-2 border-b border-white/5 pb-2">
+                <h3 className="text-sm font-bold text-sky-400 uppercase tracking-wider">Link to Vnotice Alerts (server-side)</h3>
+                {authToken && (
+                  <button onClick={handleAuthUnlink}
+                    className="px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider glass-panel text-gray-400 hover:text-white hover:bg-white/5 border border-white/10 rounded-md transition whitespace-nowrap">
+                    Unlink
+                  </button>
+                )}
+              </div>
+              <p className="text-[11px] text-gray-400">
+                Alerts below only fire automatically once linked here and saved — this connects <b>{email || "your email"}</b> to
+                a real account on the server, so the hourly background sync can email/Teams-message you without this dashboard being open.
+              </p>
+
+              {!authToken ? (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+                  <div className="space-y-1">
+                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Email</label>
+                    <input type="email" value={email} onChange={(e) => setEmail(e.target.value)}
+                      placeholder="you@mfec.co.th"
+                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-xs transition" />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider">Account Password</label>
+                    <input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)}
+                      placeholder="First time = creates the account"
+                      className="w-full bg-black/35 border border-white/10 rounded-lg p-2.5 text-white focus:border-sky-400 focus:outline-none text-xs transition" />
+                  </div>
+                  <button onClick={handleAuthLink} disabled={authBusy}
+                    className="px-4 py-2.5 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-lg font-bold text-xs transition">
+                    {authBusy ? "Linking…" : "Link Account"}
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="space-y-1">
+                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+                      Feed sources you want alerts for
+                    </label>
+                    <div className="flex flex-wrap gap-2">
+                      {Array.from(new Set(feeds.map((f) => f.name))).map((name) => {
+                        const checked = selectedFeedSources.includes(name);
+                        return (
+                          <label key={name}
+                            className={`px-2.5 py-1.5 rounded-lg border text-[11px] font-semibold cursor-pointer transition ${
+                              checked ? "bg-sky-500/20 border-sky-500/40 text-sky-300" : "bg-black/20 border-white/10 text-gray-400 hover:text-white"
+                            }`}>
+                            <input type="checkbox" checked={checked} className="hidden"
+                              onChange={() => setSelectedFeedSources((prev) =>
+                                checked ? prev.filter((s) => s !== name) : [...prev, name])} />
+                            {name}
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  <button onClick={handleSaveServerAlertSettings} disabled={authBusy}
+                    className="px-4 py-2.5 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-lg font-bold text-xs transition">
+                    {authBusy ? "Saving…" : "💾 Save Alert Settings to Server"}
+                  </button>
+                </div>
+              )}
+
+              {authMsg && <p className="text-[11px] text-gray-300">{authMsg}</p>}
+            </div>
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               {/* SMTP Credentials */}
               <div className="space-y-4 bg-black/10 p-5 rounded-xl border border-white/5">
@@ -2777,7 +3012,7 @@ export default function Dashboard() {
                             `${h.disk.used_gb} / ${h.disk.total_gb} GB`, h.disk.percent,
                             h.disk.percent > 85 ? "text-red-400" : h.disk.percent > 60 ? "text-yellow-400" : "text-violet-400")
                         : statCard("Disk", "—", "psutil not available", null, "text-gray-500")}
-                      {statCard("Uptime", `${Math.floor(h.uptime_seconds / 60)}m ${h.uptime_seconds % 60}s`,
+                      {statCard("Uptime", formatUptime(h.uptime_seconds),
                         "Since last restart", null, "text-sky-400")}
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -2822,7 +3057,7 @@ export default function Dashboard() {
                                   <div>Status: <span className={healthy ? "text-green-400" : "text-yellow-400"}>{sp.status}</span></div>
                                   <div>RAM: <span className="text-cyan-400">{sp.mem_mb} MB</span></div>
                                   <div>Threads: <span className="text-violet-400">{sp.threads}</span></div>
-                                  <div className="col-span-2">Uptime: <span className="text-sky-400">{Math.floor(up / 3600)}h {Math.floor((up % 3600) / 60)}m</span></div>
+                                  <div className="col-span-2">Uptime: <span className="text-sky-400">{formatUptime(up)}</span></div>
                                 </div>
                               </div>
                             );

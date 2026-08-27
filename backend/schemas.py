@@ -164,6 +164,7 @@ class NotifAlertRequest(BaseModel):
     description: Optional[str] = None
     reference_url: Optional[str] = None
     epss: Optional[float] = None
+    cvss_score: Optional[float] = None
 
 # Teams
 class TeamsAlertRequest(NotifAlertRequest):
@@ -218,6 +219,7 @@ class EmailTestRequest(BaseModel):
     description: Optional[str] = None
     reference_url: Optional[str] = None
     epss: Optional[float] = None
+    cvss_score: Optional[float] = None
 
 # SMS (Twilio)
 class SmsAlertRequest(NotifAlertRequest):
@@ -241,6 +243,7 @@ class TriggerCreate(BaseModel):
     product: Optional[str] = None
     min_severity: Optional[str] = None
     min_cvss_score: Optional[float] = None
+    feed_source: Optional[str] = None
 
 class TriggerResponse(BaseModel):
     id: UUID
@@ -250,6 +253,7 @@ class TriggerResponse(BaseModel):
     product: Optional[str] = None
     min_severity: Optional[str] = None
     min_cvss_score: Optional[float] = None
+    feed_source: Optional[str] = None
     created_at: Optional[datetime] = None
 
     class Config:
