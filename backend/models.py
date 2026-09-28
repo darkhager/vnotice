@@ -83,10 +83,45 @@ class CVE(Base):
     rss_source = Column(String(100))
     keywords = Column(JSON, default=list)   # extracted keywords/product terms for this CVE
     created_at = Column(DateTime(timezone=True), server_default=text('CURRENT_TIMESTAMP'))
+    # LEGACY: superseded by the cve_insights table (copied over at startup, no
+    # longer written). Left in place because SQLite can't drop columns cheaply.
+    affected_versions = Column(Text)
+    affected_conditions = Column(Text)
+    mitigation = Column(Text)
+    remediation = Column(Text)
+    fixed_versions = Column(Text)
+    iocs = Column(Text)
+    details_verification = Column(Text)   # JSON: the AI verifier's per-field verdict; cleared on re-fetch
+    details_fetched_at = Column(DateTime(timezone=True))
 
     __table_args__ = (
         UniqueConstraint('cve_id', 'rss_source', name='uq_cve_source'),
     )
+
+
+class CveInsight(Base):
+    """Extracted details + AI summary/verification, ONE row per CVE number.
+
+    Linked to `cves` by cve_id (not a FK: cves has one row per (cve_id, source),
+    and the CVE.org record these come from is per CVE number). Filled by
+    threat_summary.py for CVEs inside the admin's Threat Summary scope, and on
+    demand when someone opens a CVE's details.
+    """
+    __tablename__ = "cve_insights"
+
+    cve_id = Column(String(50), primary_key=True)
+    affected_versions = Column(Text)
+    affected_conditions = Column(Text)
+    mitigation = Column(Text)
+    remediation = Column(Text)
+    fixed_versions = Column(Text)
+    iocs = Column(Text)
+    extracted_at = Column(DateTime(timezone=True))      # when the details were extracted from CVE.org
+    ai_summary = Column(Text)                           # plain-language summary written by the AI
+    ai_verification = Column(Text)                      # JSON: per-field verdict on the extraction
+    ai_model = Column(String(100))
+    ai_checked_at = Column(DateTime(timezone=True))     # when the AI last summarised + checked it
+    ai_error = Column(Text)                             # last AI failure, cleared on success
 
 
 class UserConfig(Base):
@@ -177,4 +212,23 @@ class NotificationTrigger(Base):
             'keyword IS NOT NULL OR vendor IS NOT NULL OR product IS NOT NULL OR min_severity IS NOT NULL OR min_cvss_score IS NOT NULL',
             name='chk_trigger_condition'
         ),
+    )
+
+
+class SentAlert(Base):
+    """One row per (CVE, channel, destination) actually delivered. Checked before
+    every send, so overlapping syncs, a CVE arriving from two feeds, or a user
+    whose several triggers all match it never produce a second alert. dest_hash
+    is a sha256 of the email address / webhook URL -- webhook URLs are secrets,
+    so they aren't stored here in the clear."""
+    __tablename__ = "sent_alerts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cve_id = Column(String(50), nullable=False, index=True)
+    channel = Column(String(20), nullable=False)
+    dest_hash = Column(String(64), nullable=False)
+    sent_at = Column(DateTime(timezone=True), server_default=text('CURRENT_TIMESTAMP'))
+
+    __table_args__ = (
+        UniqueConstraint('cve_id', 'channel', 'dest_hash', name='uq_sent_alert'),
     )

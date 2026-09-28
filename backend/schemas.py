@@ -165,6 +165,7 @@ class NotifAlertRequest(BaseModel):
     reference_url: Optional[str] = None
     epss: Optional[float] = None
     cvss_score: Optional[float] = None
+    published_date: Optional[datetime] = None
 
 # Teams
 class TeamsAlertRequest(NotifAlertRequest):
@@ -220,6 +221,7 @@ class EmailTestRequest(BaseModel):
     reference_url: Optional[str] = None
     epss: Optional[float] = None
     cvss_score: Optional[float] = None
+    published_date: Optional[str] = None
 
 # SMS (Twilio)
 class SmsAlertRequest(NotifAlertRequest):

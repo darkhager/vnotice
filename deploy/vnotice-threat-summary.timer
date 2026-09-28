@@ -1,0 +1,9 @@
+[Unit]
+Description=Vnotice Threat Summary batch every 10 minutes (offset 5 min from the admin digest)
+
+[Timer]
+OnCalendar=*:5/10
+Persistent=true
+
+[Install]
+WantedBy=timers.target

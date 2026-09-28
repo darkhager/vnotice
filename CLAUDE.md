@@ -284,6 +284,7 @@ GET   /                           Root health check
 **`users`** — id(UUID), email, username, password_hash, role, is_active  
 **`cves`** — id(UUID), cve_id, title, description, severity, cvss_score, epss, published_date, vendor, product, reference_url, rss_source — unique(cve_id, rss_source)  
 **`user_configs`** — theme, polling_interval, notify_* flags, webhook URLs, feeds_config(JSON), scrapers_config(JSON), alert_keywords(JSON)  
+**`cve_insights`** — one row per cve_id (linked to `cves` by CVE number): affected_versions, affected_conditions, mitigation, remediation, fixed_versions, iocs, extracted_at, ai_summary, ai_verification(JSON), ai_model, ai_checked_at, ai_error. Filled by `threat_summary.py` (timer every 10 min) for the admin's scope (Settings → Threat Summary Management, stored in `app_state.summary_scope`) and on demand from the details panel. The old detail columns on `cves` are legacy (copied over at startup, no longer written).  
 **`notification_triggers`** — template_id(FK), keyword, vendor, product, min_severity, min_cvss_score
 
 ---

@@ -1,0 +1,9 @@
+[Unit]
+Description=Vnotice Threat Summary: extract details + AI summary/check for the admin-selected sources/products
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/vnotice/vnotice/backend
+ExecStart=/home/vnotice/vnotice/backend/venv_server/bin/python /home/vnotice/vnotice/backend/threat_summary.py
+StandardOutput=append:/home/vnotice/threat-summary.log
+StandardError=append:/home/vnotice/threat-summary.log

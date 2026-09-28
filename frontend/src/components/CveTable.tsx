@@ -1,6 +1,16 @@
 "use client";
 import React, { useState, useRef, useEffect, useCallback } from "react";
 import { Copy, Check, EyeOff, Eye, ExternalLink, ChevronUp, ChevronDown, X } from "lucide-react";
+import { getApiBase } from "../lib/api";
+
+const DETAIL_SECTIONS: [string, string][] = [
+  ["affected_versions", "Affected Versions"],
+  ["affected_conditions", "Affected Condition"],
+  ["fixed_versions", "Fix Version"],
+  ["remediation", "Remediation"],
+  ["mitigation", "Mitigation / Workaround"],
+  ["iocs", "IOCs"],
+];
 
 interface CveItem {
   id: string;
@@ -94,6 +104,49 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
   const [data,     setData]     = useState<CveItem[]>(initialData);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [visibleCount, setVisibleCount] = useState(PAGE);
+  // Detail panel: opened by clicking a row, details fetched on demand from
+  // GET /cves/{id}/details (first open pulls the CVE.org record; cached after).
+  const [selected, setSelected] = useState<CveItem | null>(null);
+  const [details, setDetails] = useState<any | null>(null);
+  const [detailsErr, setDetailsErr] = useState("");
+  const [verifying, setVerifying] = useState(false);
+  const [verifyErr, setVerifyErr] = useState("");
+  const openingRef = useRef("");   // ignore a slow response for a CVE the user has already closed/changed
+
+  const runVerify = async (id: string) => {
+    setVerifying(true);
+    setVerifyErr("");
+    try {
+      const r = await fetch(`${getApiBase()}/cves/${encodeURIComponent(id)}/verify`, { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : `HTTP ${r.status}`);
+      if (openingRef.current === id) setDetails(d);
+    } catch (e) {
+      if (openingRef.current === id) setVerifyErr(e instanceof Error ? e.message : "network error");
+    } finally {
+      if (openingRef.current === id) setVerifying(false);
+    }
+  };
+
+  const openDetails = async (cve: CveItem) => {
+    openingRef.current = cve.id;
+    setSelected(cve);
+    setDetails(null);
+    setDetailsErr("");
+    setVerifyErr("");
+    setVerifying(false);
+    try {
+      const r = await fetch(`${getApiBase()}/cves/${encodeURIComponent(cve.id)}/details`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const d = await r.json();
+      if (openingRef.current !== cve.id) return;
+      // No auto AI check here: which CVEs get AI time is the admin's call
+      // (Settings → Threat Summary Management); "Check now" does one on demand.
+      setDetails(d);
+    } catch (e) {
+      if (openingRef.current === cve.id) setDetailsErr(e instanceof Error ? e.message : "network error");
+    }
+  };
 
   // Header label for the Ingested column reflects the active timezone.
   const colLabel = (col: ColKey) => col === "ingested" ? `Ingested (${timezone})` : COLUMN_LABELS[col];
@@ -310,8 +363,12 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
         </div>
       )}
 
+      {/* bg-black/20 here (not just on rows) so that when columns don't fill the
+          panel's width, the leftover space past the last column matches the row
+          fill instead of exposing the panel's own background -- without touching
+          the table's own width/resize behavior. */}
       <div
-        className="overflow-x-auto w-full flex-1 min-h-0"
+        className="overflow-x-auto w-full flex-1 min-h-0 bg-black/20"
         onScroll={(e) => {
           // ponytail: near the bottom ⇒ reveal the next page of rows (load-on-scroll).
           const el = e.currentTarget;
@@ -320,7 +377,13 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
           }
         }}
       >
-        <table className="text-left border-collapse select-text" style={{ tableLayout: "fixed", width: totalWidth || "100%" }}>
+        {/* width: max(totalWidth, 100%) -- real columns are locked to their exact
+            px widths below (width/minWidth/maxWidth all set), so they never resize.
+            The trailing filler <th> is the only thing that's unsized, so it's the
+            only thing that absorbs any leftover space, carrying the header's own
+            bg-black/30 the rest of the way across instead of leaving it exposed. */}
+        <table className="text-left border-collapse select-text"
+          style={{ tableLayout: "fixed", width: totalWidth ? `max(${totalWidth}px, 100%)` : "100%" }}>
           <thead>
             <tr className="bg-black/30 border-b border-white/10 text-[0.7em] uppercase font-bold tracking-widest text-gray-400 select-none">
               {visibleCols.map((col) => (
@@ -338,6 +401,7 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
                   </div>
                 </th>
               ))}
+              <th aria-hidden="true" />
             </tr>
           </thead>
 
@@ -350,7 +414,8 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
               </tr>
             ) : (
               data.slice(0, visibleCount).map((cve, idx) => (
-                <tr key={cve._key || `${cve.id}_${idx}`} className="hover:bg-white/[0.015] transition-colors">
+                <tr key={cve._key || `${cve.id}_${idx}`} onClick={() => openDetails(cve)}
+                  className={`hover:bg-white/[0.03] transition-colors cursor-pointer ${selected?._key === cve._key && selected?.id === cve.id ? "bg-sky-500/[0.06]" : ""}`}>
                   {visibleCols.map((col) => renderCell(col, cve))}
                 </tr>
               ))
@@ -358,6 +423,123 @@ export default function CveTable({ textSize = "md", vulnerabilities, showColumnM
           </tbody>
         </table>
       </div>
+
+      {/* CVE detail side panel */}
+      {selected && (
+        <div className="absolute inset-0 z-40 flex justify-end bg-black/30" onClick={() => setSelected(null)}>
+          <div className="w-full max-w-xl h-full overflow-y-auto bg-[#12151f] border-l border-white/10 p-5 space-y-4 select-text"
+            onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="font-mono font-bold text-sky-400">{selected.id}</div>
+                <div className="text-sm text-white mt-1">{selected.name}</div>
+                <div className="text-[11px] text-gray-500 mt-1">
+                  {selected.vendor} · {selected.product} · {selected.severity} · CVSS {selected.score}
+                  {selected.date ? ` · Published ${selected.date}` : ""}
+                </div>
+              </div>
+              <button onClick={() => setSelected(null)} className="p-1 text-gray-500 hover:text-white rounded flex-shrink-0">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {!details && !detailsErr && <div className="text-xs text-gray-500">Loading vendor details…</div>}
+            {detailsErr && <div className="text-xs text-red-400">Could not load details: {detailsErr}</div>}
+
+            {details && (() => {
+              const v = details.verification;
+              const fv = (k: string) => v?.fields?.[k];
+              const shown = DETAIL_SECTIONS.filter(([k]) =>
+                details[k] || ["missing", "incorrect", "incomplete"].includes(fv(k)?.status));
+              return (
+                <>
+                  {/* AI verification summary */}
+                  {selected.id.startsWith("CVE-") && (
+                    <div className="text-[11px] rounded-lg border px-3 py-2 flex items-center justify-between gap-2 border-white/10 bg-black/20">
+                      <span>
+                        {verifying ? <span className="text-sky-300">🤖 AI is checking this extraction against the CVE record…</span>
+                          : verifyErr ? <span className="text-red-400">🤖 AI check failed: {verifyErr}</span>
+                          : v ? (v.status === "verified"
+                              ? <span className="text-green-400">🤖 AI verified: every field matches the vendor&apos;s record</span>
+                              : <span className="text-amber-300">🤖 AI found issues -- see the notes on each field</span>)
+                          : details.ai_configured ? <span className="text-gray-400">🤖 Not yet checked by AI</span>
+                          : <span className="text-gray-500">🤖 AI verification is off (Settings → AI Verification)</span>}
+                        {v && !verifying && <span className="text-gray-600"> · {v.model}</span>}
+                      </span>
+                      {details.ai_configured && !verifying && (
+                        <button onClick={() => runVerify(selected.id)} className="text-sky-400 hover:underline flex-shrink-0">
+                          {v ? "Re-check" : "Check now"}
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {details.ai_summary && (
+                    <div className="space-y-1">
+                      <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">🤖 AI Summary</div>
+                      <div className="text-xs text-gray-200 whitespace-pre-wrap break-words bg-sky-500/[0.05] border border-sky-500/15 rounded-lg p-3">
+                        {details.ai_summary}
+                      </div>
+                    </div>
+                  )}
+                  <div className="text-[10px] text-gray-500">
+                    Extracted: {details.extracted_at ? new Date(details.extracted_at).toLocaleString() : "not yet"}
+                    {" · "}AI checked: {details.ai_checked_at ? new Date(details.ai_checked_at).toLocaleString() : "not yet"}
+                  </div>
+
+                  {shown.length === 0 && (
+                    <div className="text-xs text-gray-500">
+                      The vendor hasn&apos;t published structured details for this {selected.id.startsWith("CVE-") ? "CVE" : "advisory"} yet.
+                      Check the advisory link below.
+                    </div>
+                  )}
+                  {shown.map(([k, label]) => {
+                    const f = fv(k);
+                    const badge = f && ({
+                      ok: ["✓ verified", "text-green-400 border-green-500/30"],
+                      incomplete: ["⚠ incomplete", "text-amber-300 border-amber-500/30"],
+                      incorrect: ["✗ incorrect", "text-red-400 border-red-500/30"],
+                      missing: ["＋ missed by extraction", "text-orange-300 border-orange-500/30"],
+                    } as Record<string, string[]>)[f.status];
+                    return (
+                      <div key={k} className="space-y-1">
+                        <div className="flex items-center gap-2">
+                          <div className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">{label}</div>
+                          {badge && <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${badge[1]}`}>{badge[0]}</span>}
+                        </div>
+                        {details[k] && (
+                          <div className={`text-xs text-gray-200 whitespace-pre-wrap break-words bg-black/25 border border-white/5 rounded-lg p-3 ${k === "iocs" ? "font-mono" : ""}`}>
+                            {details[k]}
+                          </div>
+                        )}
+                        {f && f.status !== "ok" && (f.note || f.suggested) && (
+                          <div className="text-[11px] text-gray-300 bg-amber-500/[0.05] border border-amber-500/15 rounded-lg p-2.5 space-y-1">
+                            {f.note && <div><span className="text-amber-300 font-semibold">AI note:</span> {f.note}</div>}
+                            {f.suggested && <div className="whitespace-pre-wrap break-words"><span className="text-amber-300 font-semibold">From the source:</span> {f.suggested}</div>}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </>
+              );
+            })()}
+
+            <div className="flex flex-wrap gap-3 pt-2 border-t border-white/5 text-xs">
+              {selected.url && (
+                <a href={selected.url} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline inline-flex items-center gap-1">
+                  Vendor advisory <ExternalLink className="w-3 h-3" />
+                </a>
+              )}
+              {details?.source && (
+                <a href={details.source} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline inline-flex items-center gap-1">
+                  CVE.org record <ExternalLink className="w-3 h-3" />
+                </a>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Column manager panel — triggered from outside via showColumnManager prop */}
       {showColumnManager && (

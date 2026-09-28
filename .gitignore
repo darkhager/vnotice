@@ -35,3 +35,6 @@ yarn-error.log*
 Thumbs.db
 .idea/
 .vscode/
+
+# AI provider key (Fernet-encrypted, but still never commit it)
+backend/secrets.json

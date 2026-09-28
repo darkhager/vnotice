@@ -4,6 +4,9 @@ import ProfileSelection from "./ProfileSelection";
 import CveTable from "./CveTable";
 import { ShieldAlert, Sun, Moon, LogOut, Save, Trash2, RefreshCw, X, Mail, Search } from "lucide-react";
 import { getApiBase } from "../lib/api";
+import AiSettings from "./AiSettings";
+import AdminDigestSettings from "./AdminDigestSettings";
+import ThreatSummarySettings from "./ThreatSummarySettings";
 import { pushState, pushBeacon } from "../lib/profileSync";
 
 interface UserProfile {
@@ -202,6 +205,18 @@ function formatUptime(totalSeconds: number): string {
   return `${minutes}m ${s % 60}s`;
 }
 
+// The full CVE list (~9MB at 20k rows) overflows localStorage's ~5MB quota, and
+// setItem throws. That offline cache is a nice-to-have -- it must never turn a
+// successful EPSS refresh or sync into a reported failure. On overflow, drop
+// the key so a stale older copy isn't shown on next load instead.
+function cacheVulns(list: any[]) {
+  try {
+    localStorage.setItem("vnotice_vulnerabilities", JSON.stringify(list));
+  } catch {
+    try { localStorage.removeItem("vnotice_vulnerabilities"); } catch { /* storage unavailable */ }
+  }
+}
+
 function mapApiCve(c: any) {
   const rawVendor  = c.vendor  || "";
   const rawProduct = c.product || "";
@@ -377,7 +392,17 @@ export default function Dashboard() {
   const [activeSeverity, setActiveSeverity] = useState<string[]>(['all']);
   const [activeVendors, setActiveVendors] = useState<string[]>(['all']);
   const [activeProducts, setActiveProducts] = useState<string[]>(['all']);
-  const [keywordInput, setKeywordInput] = useState("");
+  const [expandedProductGroups, setExpandedProductGroups] = useState<Set<string>>(new Set());
+  // All-time (source, product) catalog for the filter panel's option list --
+  // independent of `timeWindowDays` so a product doesn't vanish from the
+  // picker just because its only CVEs are older than the 30-day default view.
+  const [productCatalog, setProductCatalog] = useState<{ source: string; product: string; count: number }[]>([]);
+  const loadProductCatalog = async () => {
+    try {
+      const res = await fetch(`${getApiBase()}/cves/products`);
+      if (res.ok) setProductCatalog(await res.json());
+    } catch { /* non-fatal -- panel just falls back to whatever's currently loaded */ }
+  };
   const [activeKeywords, setActiveKeywords] = useState<string[]>([]);
   const [activeFeedsFilter, setActiveFeedsFilter] = useState<string[]>(["all"]);
   const [epssMin, setEpssMin] = useState<string>("");
@@ -387,11 +412,17 @@ export default function Dashboard() {
   const [isRefreshingEpss, setIsRefreshingEpss] = useState(false);
   const [syncCountdown, setSyncCountdown] = useState<number>(900);
   const [vulnerabilities, setVulnerabilities] = useState<any[]>([]);
-  // CVE time window: 30 = last 30 days (lighter default), null = all time.
-  // Drives the server-side `days` filter so the payload itself is smaller.
+  // CVE time window: 30 = last 30 days (default), null = all time. The
+  // database itself now keeps every CVE it has ever ingested (no more
+  // purging), so this is purely a display cap -- "Total Threats" etc. show
+  // the real count for whatever window is selected, not a truncated sample.
   const [timeWindowDays, setTimeWindowDays] = useState<number | null>(30);
+  // limit=20000 is the backend's own hard ceiling (main.py) -- the real 30-day
+  // total (7,467 as of writing) comfortably fits, so "Total Threats" and every
+  // severity/product/vendor count derived from `vulnerabilities` reflects the
+  // real database count instead of silently truncating at a lower cap.
   const cvesUrl = (days: number | null) =>
-    `${getApiBase()}/cves/?limit=5000${days ? `&days=${days}` : ""}`;
+    `${getApiBase()}/cves/?limit=20000${days ? `&days=${days}` : ""}`;
 
   // Alert Rules state
   const [alertRules, setAlertRules] = useState<AlertRule[]>([]);
@@ -412,7 +443,7 @@ export default function Dashboard() {
     return [];
   });
   const [selectedDashboardId, setSelectedDashboardId] = useState<string | null>(null);
-  const [activeSettingsSection, setActiveSettingsSection] = useState<"account" | "alerts" | "console" | "accounts" | "engine" | "resource">("account");
+  const [activeSettingsSection, setActiveSettingsSection] = useState<"account" | "alerts" | "console" | "accounts" | "engine" | "resource" | "ai" | "digest" | "threatsum">("account");
   const [engineHealth, setEngineHealth] = useState<any>(null);
   const [engineHealthLoading, setEngineHealthLoading] = useState(false);
   const [usageData, setUsageData] = useState<any[]>([]);
@@ -542,6 +573,12 @@ export default function Dashboard() {
   const authHeaders = (): Record<string, string> =>
     authToken ? { Authorization: `Bearer ${authToken}` } : {};
 
+  // One click for a new user: register/log in, default to every currently
+  // configured feed (skipped if they already have trigger rules -- a
+  // returning user re-linking shouldn't have their picks overwritten), and
+  // save whatever delivery config (SMTP/Teams) is already filled in on this
+  // same page. A brand-new user's whole setup is "fill in two panels, click
+  // one button" instead of link -> pick feeds -> save as three separate steps.
   const handleAuthLink = async () => {
     if (!email.trim() || !authPassword.trim()) {
       window.alert("Enter your email and an account password first.");
@@ -581,11 +618,58 @@ export default function Dashboard() {
         throw new Error(typeof d.detail === "string" ? d.detail : "Login failed -- check the password.");
       }
       const data = await r.json();
-      setAuthToken(data.access_token);
-      if (activeProfileId) localStorage.setItem(`vnotice_auth_token_${activeProfileId}`, data.access_token);
+      const token = data.access_token;
+      const hdrs = { Authorization: `Bearer ${token}` };
+      setAuthToken(token);
+      if (activeProfileId) localStorage.setItem(`vnotice_auth_token_${activeProfileId}`, token);
       setAuthPassword("");
-      setAuthMsg(`✓ Linked as ${email.trim()}`);
-      appendLog(`[NET] Linked alert account for ${email.trim()}`);
+
+      const trigRes = await fetch(`${base}/triggers/`, { headers: hdrs });
+      const existing: any[] = trigRes.ok ? await trigRes.json() : [];
+      const map: Record<string, string> = {};
+      existing.forEach((t) => { if (t.feed_source) map[t.feed_source] = t.id; });
+      const isNewSetup = existing.length === 0;
+      // New users default to every feed EXCEPT the NVD firehose (~355 CVEs/day --
+      // one email each would bury them); they can still tick it themselves.
+      const feedsToUse = isNewSetup
+        ? [...feeds, ...webScrapers].map((f: any) => f.name).filter((n: string) => !/nvd|nist/i.test(n))
+        : Object.keys(map);
+      setExistingTriggerIds(map);
+      setSelectedFeedSources(feedsToUse);
+
+      const cfgBody: Record<string, unknown> = {
+        notify_email: emailAlertsEnabled,
+        notify_teams: teamsAlertsEnabled,
+      };
+      if (smtpHost.trim()) cfgBody.smtp_host = smtpHost.trim();
+      if (smtpPort.trim()) cfgBody.smtp_port = parseInt(smtpPort) || 587;
+      if (smtpUsername.trim()) cfgBody.smtp_username = smtpUsername.trim();
+      if (smtpPassword.trim()) cfgBody.smtp_password = smtpPassword;
+      if (email.trim()) cfgBody.smtp_to_address = email.trim();
+      if (teamsWebhookUrl.trim()) cfgBody.teams_webhook = teamsWebhookUrl.trim();
+      const cfgRes = await fetch(`${base}/users/me/config`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", ...hdrs },
+        body: JSON.stringify(cfgBody),
+      });
+      if (!cfgRes.ok) {
+        const d = await cfgRes.json().catch(() => ({}));
+        throw new Error(typeof d.detail === "string" ? d.detail : `Could not save alert settings (HTTP ${cfgRes.status})`);
+      }
+
+      if (isNewSetup && feedsToUse.length > 0) {
+        for (const src of feedsToUse) {
+          await fetch(`${base}/triggers/`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...hdrs },
+            body: JSON.stringify({ feed_source: src, min_cvss_score: 0 }),
+          });
+        }
+        await loadTriggers(token);
+      }
+
+      setAuthMsg(`✓ Linked as ${email.trim()} -- alerts will fire on the next hourly sync.`);
+      appendLog(`[NET] Linked alert account for ${email.trim()} and saved default alert settings`);
     } catch (e) {
       setAuthMsg(`✗ ${e instanceof Error ? e.message : "Login failed"}`);
     } finally {
@@ -862,10 +946,10 @@ export default function Dashboard() {
         return v;
       });
 
-      if (migrated) localStorage.setItem("vnotice_vulnerabilities", JSON.stringify(loadedVulns));
+      if (migrated) cacheVulns(loadedVulns);
     } else {
       loadedVulns = cveMockData;
-      localStorage.setItem("vnotice_vulnerabilities", JSON.stringify(loadedVulns));
+      cacheVulns(loadedVulns);
     }
     setVulnerabilities(loadedVulns);
 
@@ -912,11 +996,12 @@ export default function Dashboard() {
           return { ...v, url: ensureAbsoluteCveUrl(c.reference_url, c.cve_id) };
         });
         setVulnerabilities(mapped);
-        localStorage.setItem("vnotice_vulnerabilities", JSON.stringify(mapped));
+        cacheVulns(mapped);
         appendLog(`[NET] Active database connected (${timeWindowDays ? `last ${timeWindowDays} days` : "all time"}).`);
       } catch {
         appendLog(`[NET] Local SQLite database active. Offline fallback active.`);
       }
+      if (!cancelled) loadProductCatalog();
     })();
     return () => { cancelled = true; };
   }, [timeWindowDays]);
@@ -1161,11 +1246,10 @@ export default function Dashboard() {
     localStorage.setItem("vnotice_stream_sync_mode", mode);
   };
 
-  // Re-pull real EPSS scores from FIRST.org for all stored CVEs (fills newly
-  // available scores and updates changed ones), then reload the grid.
+  // Re-pull real EPSS scores from FIRST.org for CVEs still showing N/A.
   const handleRefreshEpss = async () => {
     setIsRefreshingEpss(true);
-    appendLog(`[NET] Refreshing EPSS scores from FIRST.org...`);
+    appendLog(`[NET] Refreshing EPSS scores for CVEs missing one...`);
     try {
       const res = await fetch(`${getApiBase()}/cves/refresh-epss`, { method: "POST" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1178,7 +1262,7 @@ export default function Dashboard() {
           return { ...v, url: ensureAbsoluteCveUrl(c.reference_url, c.cve_id) };
         });
         setVulnerabilities(mapped);
-        localStorage.setItem("vnotice_vulnerabilities", JSON.stringify(mapped));
+        cacheVulns(mapped);
       }
       appendLog(`[NET] EPSS refresh: ${r.with_epss} scored · ${r.na} N/A (of ${r.total}).`);
       window.alert(`EPSS updated: ${r.with_epss} scored, ${r.na} N/A (of ${r.total}).`);
@@ -1231,8 +1315,9 @@ export default function Dashboard() {
               return { ...v, url: ensureAbsoluteCveUrl(c.reference_url, c.cve_id) };
             });
             setVulnerabilities(mapped);
-            localStorage.setItem("vnotice_vulnerabilities", JSON.stringify(mapped));
+            cacheVulns(mapped);
             appendLog(`[SYS] Threat Stream updated successfully from PostgreSQL database.`);
+            loadProductCatalog();
             setIsSyncing(false);
             return;
           }
@@ -1526,9 +1611,11 @@ export default function Dashboard() {
       (minVal === null || (vuln.epss ?? 0) * 100 >= minVal) &&
       (maxVal === null || (vuln.epss ?? 0) * 100 <= maxVal);
 
+    const matchesProductFilter = matchesProductHelper(vuln.product ?? "", activeProducts);
+
     return matchesQuery && matchesSeverity && matchesKeywords &&
-           matchesFeedFilter && matchesFeedActive && matchesScraperActive && matchesEpss;
-  }), [vulnerabilities, searchQuery, activeSeverity, activeKeywords, activeFeedsFilter, feeds, webScrapers, epssMin, epssMax]);
+           matchesFeedFilter && matchesFeedActive && matchesScraperActive && matchesEpss && matchesProductFilter;
+  }), [vulnerabilities, searchQuery, activeSeverity, activeKeywords, activeFeedsFilter, activeProducts, feeds, webScrapers, epssMin, epssMax]);
 
   // Keyword filter handlers
   const handleAddKeyword = (kw: string) => {
@@ -1566,6 +1653,15 @@ export default function Dashboard() {
       // Collapse a full set back to the "all" sentinel (re-ticks master); empty stays empty.
       return isFull(next) ? ["all"] : next;
     });
+
+    // Ticking a specific source shouldn't be silently vetoed by a stale empty
+    // product selection left over from "Deselect All" -- the product and
+    // source filters AND together, so an empty activeProducts matches
+    // nothing regardless of what source you just turned on. Only nudge it
+    // when it's actually empty; leave a real product selection alone.
+    if (feedName !== "all") {
+      setActiveProducts((prev) => (prev.length === 0 ? ["all"] : prev));
+    }
   };
 
   // Alert Rules managers
@@ -1642,6 +1738,7 @@ export default function Dashboard() {
           cve_id: v.id, title: v.name || v.id, severity: v.severity || "Medium",
           description: v.description || "", reference_url: v.url || "",
           epss: v.epss ?? null, cvss_score: v.score ?? null,
+          published_date: v.date && v.date !== "Unknown" ? v.date : null,
         }),
       });
       const data = await r.json().catch(() => ({}));
@@ -1957,23 +2054,56 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                {/* Search query input */}
+                {/* Search / Keyword bar -- one input instead of two duplicate ones.
+                    Typing (or pressing Enter) live-filters immediately -- the old
+                    "Search" behavior, Enter just confirms it, nothing more.
+                    "Add Filter" is the only way to pin the current text as a
+                    persistent keyword tag (the old standalone "Keyword Filter"
+                    behavior), then clears the bar so the live search resets while
+                    the tag keeps filtering on its own. */}
                 <div className="space-y-1.5">
                   <label className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-                    Search Advisories
+                    Search / Keyword Filter
                   </label>
-                  <div className="relative">
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="Search CVEs, products, brands..."
-                      className="w-full bg-white/[0.01] hover:bg-white/[0.02] border border-white/5 rounded-xl py-2.5 pl-10 pr-4 text-white placeholder-gray-500 focus:border-sky-500/50 focus:bg-white/[0.03] focus:shadow-[0_0_15px_rgba(0,210,255,0.1)] focus:outline-none text-[0.85em] transition duration-200"
-                    />
-                    <svg className="w-4 h-4 text-gray-500 absolute left-3.5 top-1/2 -translate-y-1/2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-4.35-4.35M17 10a7 7 0 11-14 0 7 7 0 0114 0z" />
-                    </svg>
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") e.preventDefault(); }}
+                        placeholder="Search CVEs, products, brands..."
+                        className="w-full bg-white/[0.01] hover:bg-white/[0.02] border border-white/5 rounded-xl py-2.5 pl-10 pr-4 text-white placeholder-gray-500 focus:border-sky-500/50 focus:bg-white/[0.03] focus:shadow-[0_0_15px_rgba(0,210,255,0.1)] focus:outline-none text-[0.85em] transition duration-200"
+                      />
+                      <svg className="w-4 h-4 text-gray-500 absolute left-3.5 top-1/2 -translate-y-1/2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 21l-4.35-4.35M17 10a7 7 0 11-14 0 7 7 0 0114 0z" />
+                      </svg>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => { if (searchQuery.trim()) { handleAddKeyword(searchQuery); setSearchQuery(""); } }}
+                      className="px-3 py-1.5 bg-sky-500/20 hover:bg-sky-500/30 border border-sky-500/30 rounded-xl text-sky-400 text-[0.75em] font-bold transition-all flex-shrink-0"
+                      title="Pin the current search as a persistent keyword filter"
+                    >
+                      + Add Filter
+                    </button>
                   </div>
+                  {activeKeywords.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      {activeKeywords.map((kw) => (
+                        <button
+                          key={kw}
+                          type="button"
+                          onClick={() => handleRemoveKeyword(kw)}
+                          className="px-2 py-0.5 text-[10px] font-bold bg-sky-500/10 hover:bg-red-500/10 border border-sky-500/20 hover:border-red-500/30 text-sky-400 hover:text-red-400 rounded-lg transition flex items-center gap-1 group"
+                          title="Click to remove"
+                        >
+                          <span>{kw}</span>
+                          <span className="text-gray-500 group-hover:text-red-400">✕</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 {/* Severity Pills selection (Reduced size & Multi-select active severity - Req 1 & Req 3) */}
@@ -2041,52 +2171,6 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                {/* Keyword Tag Filter */}
-                <div className="space-y-2 pt-2.5 border-t border-white/5">
-                  <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-                    Keyword Filter
-                  </span>
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      placeholder="Add keyword & press Enter..."
-                      value={keywordInput}
-                      onChange={(e) => setKeywordInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && keywordInput.trim()) {
-                          e.preventDefault();
-                          handleAddKeyword(keywordInput);
-                          setKeywordInput("");
-                        }
-                      }}
-                      className="flex-1 bg-white/[0.01] border border-white/5 rounded-xl py-1.5 px-3 text-[0.8em] text-white placeholder-gray-500 focus:border-sky-500/50 focus:outline-none transition"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => { if (keywordInput.trim()) { handleAddKeyword(keywordInput); setKeywordInput(""); } }}
-                      className="px-3 py-1.5 bg-sky-500/20 hover:bg-sky-500/30 border border-sky-500/30 rounded-xl text-sky-400 text-[0.75em] font-bold transition-all"
-                    >
-                      Add
-                    </button>
-                  </div>
-                  {activeKeywords.length > 0 && (
-                    <div className="flex flex-wrap gap-1.5 pt-1">
-                      {activeKeywords.map((kw) => (
-                        <button
-                          key={kw}
-                          type="button"
-                          onClick={() => handleRemoveKeyword(kw)}
-                          className="px-2 py-0.5 text-[10px] font-bold bg-sky-500/10 hover:bg-red-500/10 border border-sky-500/20 hover:border-red-500/30 text-sky-400 hover:text-red-400 rounded-lg transition flex items-center gap-1 group"
-                          title="Click to remove"
-                        >
-                          <span>{kw}</span>
-                          <span className="text-gray-500 group-hover:text-red-400">✕</span>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
                 {/* EPSS Score Range Filter */}
                 <div className="space-y-2 pt-2.5 border-t border-white/5">
                   <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest">EPSS Score Range</span>
@@ -2117,94 +2201,155 @@ export default function Dashboard() {
                   </div>
                 </div>
 
-                {/* RSS Feed Source Filter */}
+                {/* Combined Source + Product filter -- these used to be two separate
+                    panels (Threat Source, Product) that overlapped almost entirely:
+                    every product already groups under the source it came from, so a
+                    source row now expands to reveal its own products in-place instead
+                    of duplicating the same source list twice. */}
                 <div className="space-y-2 pt-2.5 border-t border-white/5">
                   <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-                    Filter by Threat Source
+                    Filter by Source &amp; Product
                   </span>
-                  <div className="flex flex-col gap-1.5 max-h-40 overflow-y-auto pr-1">
-                    <label className="flex items-center gap-2 cursor-pointer select-none">
-                      <input
-                        type="checkbox"
-                        checked={activeFeedsFilter.includes("all")}
-                        onChange={() => handleToggleFeedFilter("all")}
-                        className="rounded border-white/10 bg-black/40 accent-sky-500 flex-shrink-0"
-                      />
-                      <span className="flex-1 text-[0.78em] font-bold text-gray-300">All Sources</span>
+                  <div className="flex flex-col gap-1 max-h-72 overflow-y-auto pr-1">
+                    <div className="flex items-center gap-2">
+                      <span className="flex-1 text-[0.78em] font-bold text-gray-300">All Sources &amp; Products</span>
                       <span className="text-[0.7em] font-mono font-bold text-sky-400 bg-sky-500/10 border border-sky-500/20 px-1.5 py-0.5 rounded min-w-[2em] text-center flex-shrink-0">
                         {vulnerabilities.length}
                       </span>
-                    </label>
-                    {[...feeds, ...webScrapers].map((src: any) => {
-                      const name = src.name;
-                      // ponytail: "All Sources" selected ⇒ every source box shows checked too
-                      const isChecked = activeFeedsFilter.includes("all") || activeFeedsFilter.includes(name);
-                      const count = vulnerabilities.filter(v =>
-                        (v.source || "").toLowerCase().trim() === name.toLowerCase().trim()
-                      ).length;
-                      return (
-                        <label key={name} className="flex items-center gap-2 cursor-pointer select-none">
-                          <input
-                            type="checkbox"
-                            checked={isChecked}
-                            onChange={() => handleToggleFeedFilter(name)}
-                            className="rounded border-white/10 bg-black/40 accent-sky-500 flex-shrink-0"
-                          />
-                          <span className="flex-1 text-[0.78em] text-gray-400 hover:text-white truncate" title={name}>
-                            {name}
-                          </span>
-                          <span className={`text-[0.7em] font-mono font-bold px-1.5 py-0.5 rounded min-w-[2em] text-center flex-shrink-0 ${
-                            count > 0
-                              ? "text-gray-300 bg-white/10 border border-white/10"
-                              : "text-gray-600 bg-black/20 border border-white/5"
-                          }`}>
-                            {count}
-                          </span>
-                        </label>
-                      );
-                    })}
+                    </div>
+                    {(() => {
+                      // Built from the all-time /cves/products catalog, not the
+                      // (display-window-limited) `vulnerabilities` list -- a product
+                      // whose only CVEs are older than 30 days still shows up here.
+                      const bySource = new Map<string, Map<string, number>>();
+                      const sourceTotals = new Map<string, number>();
+                      productCatalog.forEach((row) => {
+                        const key = (row.source || "").toLowerCase().trim();
+                        if (!bySource.has(key)) bySource.set(key, new Map());
+                        bySource.get(key)!.set(row.product, row.count);
+                        sourceTotals.set(key, (sourceTotals.get(key) || 0) + row.count);
+                      });
+                      return [...feeds, ...webScrapers].map((src: any) => {
+                        const name = src.name;
+                        const key = name.toLowerCase().trim();
+                        // ponytail: "All Sources" selected ⇒ every source box shows checked too
+                        const isChecked = activeFeedsFilter.includes("all") || activeFeedsFilter.includes(name);
+                        const count = sourceTotals.get(key) || 0;
+                        const productCounts = bySource.get(key) || new Map<string, number>();
+                        const products = Array.from(productCounts.keys()).sort();
+                        const hasSubProducts = products.length > 1;
+                        const isExpanded = expandedProductGroups.has(name);
+                        return (
+                          <div key={name}>
+                            <div className="flex items-center gap-1.5">
+                              {hasSubProducts ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setExpandedProductGroups((prev) => {
+                                    const next = new Set(prev);
+                                    next.has(name) ? next.delete(name) : next.add(name);
+                                    return next;
+                                  })}
+                                  className="flex-shrink-0 p-0.5"
+                                  title={`${products.length} products`}
+                                >
+                                  <span className={`text-[0.65em] text-gray-500 transition-transform inline-block ${isExpanded ? "rotate-90" : ""}`}>▶</span>
+                                </button>
+                              ) : (
+                                <span className="w-[1.1em] flex-shrink-0" />
+                              )}
+                              <label className="flex items-center gap-2 cursor-pointer select-none flex-1 min-w-0">
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={() => handleToggleFeedFilter(name)}
+                                  className="rounded border-white/10 bg-black/40 accent-sky-500 flex-shrink-0"
+                                />
+                                <span className="flex-1 text-[0.78em] text-gray-400 hover:text-white truncate" title={name}>
+                                  {name}
+                                </span>
+                              </label>
+                              <span className={`text-[0.7em] font-mono font-bold px-1.5 py-0.5 rounded min-w-[2em] text-center flex-shrink-0 ${
+                                count > 0
+                                  ? "text-gray-300 bg-white/10 border border-white/10"
+                                  : "text-gray-600 bg-black/20 border border-white/5"
+                              }`}>
+                                {count}
+                              </span>
+                            </div>
+                            {hasSubProducts && isExpanded && (
+                              <div className="flex flex-col gap-1 pl-6 pt-1 pb-1">
+                                {products.map((prod) => {
+                                  const prodChecked = activeProducts.includes("all") || activeProducts.includes(prod);
+                                  const prodCount = productCounts.get(prod) || 0;
+                                  return (
+                                    <label key={prod} className="flex items-center gap-2 cursor-pointer select-none">
+                                      <input
+                                        type="checkbox"
+                                        checked={prodChecked}
+                                        onChange={() => {
+                                          toggleFilter(activeProducts, setActiveProducts, prod);
+                                          // Same fix as the source checkbox, the other way around: a
+                                          // stale empty source selection (from "Deselect All") would
+                                          // otherwise silently veto the product you just ticked.
+                                          setActiveFeedsFilter((prev) => (prev.length === 0 ? ["all"] : prev));
+                                        }}
+                                        className="rounded border-white/10 bg-black/40 accent-sky-500 flex-shrink-0"
+                                      />
+                                      <span className="flex-1 text-[0.76em] text-gray-400 hover:text-white truncate" title={prod}>
+                                        {prod}
+                                      </span>
+                                      <span className="text-[0.7em] font-mono font-bold text-gray-300 bg-white/10 border border-white/10 px-1.5 py-0.5 rounded min-w-[2em] text-center flex-shrink-0">
+                                        {prodCount}
+                                      </span>
+                                    </label>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      });
+                    })()}
                   </div>
-                </div>
-
-                {/* Retention is enforced server-side (purged nightly on sync), so there's
-                    nothing to toggle here anymore — just explain the window. */}
-                <div className="space-y-1.5 pt-2.5 border-t border-white/5">
-                  <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-                    Data Retention
-                  </span>
-                  <p className="text-[0.72em] text-gray-500 leading-relaxed">
-                    Showing CVEs published in the last 30 days. Older entries are purged automatically during each sync.
-                  </p>
                 </div>
 
                 {/* Reset button */}
                 <div className="pt-3 border-t border-white/5 space-y-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActiveSeverity(["all"]);
-                      setActiveVendors(["all"]);
-                      setActiveProducts(["all"]);
-                      setActiveKeywords([]);
-                      setActiveFeedsFilter(["all"]);
-                      setKeywordInput("");
-                      setSearchQuery("");
-                      setEpssMin("");
-                      setEpssMax("");
-                      setTimeWindowDays(30);
-                      appendLog("[SYS] Reset Threat Stream filters to defaults.");
-                    }}
-                    className="w-full px-3 py-2 text-xs font-bold bg-white/[0.01] hover:bg-red-500/10 border border-white/5 hover:border-red-500/30 text-gray-400 hover:text-red-400 rounded-xl transition duration-200 flex items-center justify-center gap-1.5"
-                  >
-                    🔄 Reset Filters to Default
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => { setSaveDashboardName(""); setShowSaveDashboardModal(true); }}
-                    className="w-full px-3 py-2 text-xs font-bold bg-white/[0.01] hover:bg-sky-500/10 border border-white/5 hover:border-sky-500/30 text-gray-400 hover:text-sky-400 rounded-xl transition duration-200 flex items-center justify-center gap-1.5"
-                  >
-                    📌 Save to Dashboard
-                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveSeverity(["all"]);
+                        setActiveVendors(["all"]);
+                        setActiveProducts(["all"]);
+                        setActiveKeywords([]);
+                        setActiveFeedsFilter(["all"]);
+                        setSearchQuery("");
+                        setEpssMin("");
+                        setEpssMax("");
+                        setTimeWindowDays(30);
+                        appendLog("[SYS] Selected all Threat Stream filters (default view).");
+                      }}
+                      className="flex-1 px-3 py-2 text-xs font-bold bg-white/[0.01] hover:bg-sky-500/10 border border-white/5 hover:border-sky-500/30 text-gray-400 hover:text-sky-400 rounded-xl transition duration-200 flex items-center justify-center gap-1.5"
+                    >
+                      ✅ Select All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        // Clears the whole Source & Product panel (both levels of ticks);
+                        // severity, keywords, search and EPSS are deliberately left alone.
+                        setActiveFeedsFilter([]);
+                        setActiveProducts([]);
+                        appendLog("[SYS] Deselected all sources & products -- showing none until you pick one.");
+                      }}
+                      title="Untick every source and product (severity, keywords, search and EPSS are left as-is)"
+                      className="flex-1 px-3 py-2 text-xs font-bold bg-white/[0.01] hover:bg-red-500/10 border border-white/5 hover:border-red-500/30 text-gray-400 hover:text-red-400 rounded-xl transition duration-200 flex items-center justify-center gap-1.5"
+                    >
+                      ❌ Deselect All
+                    </button>
+                  </div>
                   <button
                     type="button"
                     onClick={() => { setSaveAlertName(""); setSaveAlertDescription(""); setEditingAlertId(null); setEditConditions([currentFilterGroup()]); setShowSaveAlertModal(true); }}
@@ -2213,71 +2358,23 @@ export default function Dashboard() {
                     💾 Save as Alert
                   </button>
                 </div>
+
+                {/* Nothing is ever deleted server-side anymore -- this is a display
+                    window only, so just explain that. Last item in the section. */}
+                <div className="space-y-1.5 pt-2.5 border-t border-white/5">
+                  <span className="block text-[10px] font-bold text-gray-400 uppercase tracking-widest">
+                    Data Retention
+                  </span>
+                  <p className="text-[0.72em] text-gray-500 leading-relaxed">
+                    Showing CVEs published in the last 30 days by default. Nothing is deleted -- older CVEs stay in the database and are still counted elsewhere (e.g. the Centralize integration).
+                  </p>
+                </div>
               </div>
             </div>
 
             {/* Right Column: Widgets & Cards stream list (3/4 Weight - lg:col-span-9) */}
             <div className="lg:col-span-9 flex flex-col gap-4 min-h-0">
               
-              {/* Counter widgets row */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 flex-shrink-0">
-                <div className="glass-panel p-4 rounded-xl flex flex-col items-center justify-center relative overflow-hidden border border-red-500/10 shadow-lg">
-                  <div className="absolute top-0 right-0 p-2 text-red-500 opacity-10">
-                    <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                    </svg>
-                  </div>
-                  <div className="text-3xl font-extrabold text-red-500 relative z-10 select-none">
-                    {vulnerabilities.filter(v => v.severity.toLowerCase() === "critical").length}
-                  </div>
-                  <div className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-1 relative z-10">
-                    Critical
-                  </div>
-                </div>
-
-                <div className="glass-panel p-4 rounded-xl flex flex-col items-center justify-center relative overflow-hidden border border-orange-500/10 shadow-lg">
-                  <div className="absolute top-0 right-0 p-2 text-orange-500 opacity-10">
-                    <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                    </svg>
-                  </div>
-                  <div className="text-3xl font-extrabold text-orange-500 relative z-10 select-none">
-                    {vulnerabilities.filter(v => v.severity.toLowerCase() === "high").length}
-                  </div>
-                  <div className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-1 relative z-10">
-                    High
-                  </div>
-                </div>
-
-                <div className="glass-panel p-4 rounded-xl flex flex-col items-center justify-center relative overflow-hidden border border-sky-500/10 shadow-lg">
-                  <div className="absolute top-0 right-0 p-2 text-sky-400 opacity-10">
-                    <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 5c7.18 0 13 5.82 13 13M6 11a7 7 0 017 7m-7 0h.01" />
-                    </svg>
-                  </div>
-                  <div className="text-3xl font-extrabold text-sky-400 relative z-10 select-none">
-                    {activeFeedsCount}
-                  </div>
-                  <div className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-1 relative z-10">
-                    Active Feeds
-                  </div>
-                </div>
-
-                <div className="glass-panel p-4 rounded-xl flex flex-col items-center justify-center relative overflow-hidden border border-green-500/10 shadow-lg">
-                  <div className="absolute top-0 right-0 p-2 text-green-500 opacity-10">
-                    <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 002 2h2a2 2 0 002-2z" />
-                    </svg>
-                  </div>
-                  <div className="text-3xl font-extrabold text-green-500 relative z-10 select-none">
-                    {vulnerabilities.length}
-                  </div>
-                  <div className="text-[10px] text-gray-400 font-bold uppercase tracking-wider mt-1 relative z-10">
-                    Total Threats
-                  </div>
-                </div>
-              </div>
-
               {/* Threat Grid — main view */}
               <div className="h-[750px] flex flex-col glass-panel border border-white/5 shadow-2xl min-h-0 rounded-2xl overflow-hidden">
                 {/* Sync controls header */}
@@ -2320,10 +2417,10 @@ export default function Dashboard() {
                       onClick={handleRefreshEpss}
                       disabled={isRefreshingEpss}
                       className="flex items-center gap-2 px-3 py-1.5 text-[0.8em] font-semibold glass-panel border border-white/10 text-gray-300 hover:text-white hover:bg-white/5 rounded-xl transition duration-200 disabled:opacity-50"
-                      title="Re-pull real EPSS scores from FIRST.org for all CVEs"
+                      title="Re-pull real EPSS scores from FIRST.org for CVEs currently showing N/A"
                     >
                       <RefreshCw className={`w-[1.2em] h-[1.2em] flex-shrink-0 ${isRefreshingEpss ? "animate-spin" : ""}`} />
-                      <span>{isRefreshingEpss ? "Updating..." : "Refresh EPSS"}</span>
+                      <span>{isRefreshingEpss ? "Updating..." : "Refresh N/A EPSS"}</span>
                     </button>
                     <button
                       onClick={() => setShowColMgr(v => !v)}
@@ -2508,6 +2605,11 @@ export default function Dashboard() {
                   { id: "account",  icon: "👤", label: "Account Settings",   sub: "Profile · Display" },
                   { id: "alerts",   icon: "🔔", label: "Alert Channels",     sub: "SMTP · Teams · SMS" },
                   { id: "engine",   icon: "🔧", label: "Engine Status",      sub: "Health · Resources" },
+                  { id: "ai",       icon: "🤖", label: "AI Verification",    sub: "Provider · Key · Models" },
+                  { id: "digest",   icon: "📋", label: "Admin Summary",      sub: "10-min Teams digest" },
+                  ...(isAdminProfile(activeProfile)
+                    ? [{ id: "threatsum", icon: "🧠", label: "Threat Summary Management", sub: "AI summary scope · Admin" }]
+                    : []),
                   { id: "resource", icon: "📊", label: "Resource Usage",     sub: "CPU · Mem · Disk history" },
                   { id: "console",  icon: "💻", label: "System Console",     sub: "Audit logs" },
                   { id: "accounts", icon: "👥", label: "Account Management", sub: "Operator profiles" },
@@ -2614,7 +2716,7 @@ export default function Dashboard() {
                 effect for real, unattended alerts once linked + saved here. */}
             <div className="space-y-4 bg-sky-500/[0.04] p-5 rounded-xl border border-sky-500/15">
               <div className="flex items-center justify-between gap-2 border-b border-white/5 pb-2">
-                <h3 className="text-sm font-bold text-sky-400 uppercase tracking-wider">Link to Vnotice Alerts (server-side)</h3>
+                <h3 className="text-sm font-bold text-sky-400 uppercase tracking-wider">Get Alerts (server-side)</h3>
                 {authToken && (
                   <button onClick={handleAuthUnlink}
                     className="px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider glass-panel text-gray-400 hover:text-white hover:bg-white/5 border border-white/10 rounded-md transition whitespace-nowrap">
@@ -2622,10 +2724,19 @@ export default function Dashboard() {
                   </button>
                 )}
               </div>
-              <p className="text-[11px] text-gray-400">
-                Alerts below only fire automatically once linked here and saved — this connects <b>{email || "your email"}</b> to
-                a real account on the server, so the hourly background sync can email/Teams-message you without this dashboard being open.
-              </p>
+              {!authToken && (
+                <p className="text-[11px] text-gray-400">
+                  New here? Optional but recommended: fill in <b>Email Alerts</b> (or <b>Teams</b>) below first so delivery
+                  is ready right away. Then enter an email + password here and click <b>Get Alerts</b> — one click creates
+                  your account, turns on every current feed, and saves everything. No separate steps.
+                </p>
+              )}
+              {authToken && (
+                <p className="text-[11px] text-gray-400">
+                  Linked as <b>{email || "your email"}</b>. Adjust which feeds you get alerted on below, or update
+                  Email/Teams delivery and click <b>Save Alert Settings to Server</b> to apply changes.
+                </p>
+              )}
 
               {!authToken ? (
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
@@ -2643,7 +2754,7 @@ export default function Dashboard() {
                   </div>
                   <button onClick={handleAuthLink} disabled={authBusy}
                     className="px-4 py-2.5 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-white rounded-lg font-bold text-xs transition">
-                    {authBusy ? "Linking…" : "Link Account"}
+                    {authBusy ? "Setting up…" : "Get Alerts"}
                   </button>
                 </div>
               ) : (
@@ -3070,6 +3181,10 @@ export default function Dashboard() {
               })()}
             </div>
             )}
+
+            {activeSettingsSection === "ai" && <AiSettings />}
+            {activeSettingsSection === "digest" && <AdminDigestSettings />}
+            {activeSettingsSection === "threatsum" && isAdminProfile(activeProfile) && <ThreatSummarySettings />}
 
             {/* Section: Resource Usage (CPU/mem/disk history) */}
             {activeSettingsSection === "resource" && (

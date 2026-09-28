@@ -4,7 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from main import app
+from main import app, _RATE_LIMIT_BUCKETS
 from database import get_db, Base
 import models
 from auth import get_password_hash
@@ -36,6 +36,10 @@ def test_db():
 
 @pytest.fixture()
 def client(test_db):
+    # The rate limiter's buckets are an in-memory dict on the app module, so
+    # without this every test after the 5th /token or /users/ call in the
+    # whole run trips the real production limit and gets a 429.
+    _RATE_LIMIT_BUCKETS.clear()
     return TestClient(app)
 
 def test_read_root(client):

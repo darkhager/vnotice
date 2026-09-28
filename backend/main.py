@@ -4,12 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import List, Optional
-from datetime import timedelta, datetime
-import random
+from datetime import timedelta, datetime, timezone
 import uuid
 import re
 import json
 import asyncio
+import gzip
+import threading
 import smtplib
 import ssl
 from email.mime.text import MIMEText
@@ -26,6 +27,10 @@ import source_store
 import resource_monitor
 from database import get_db, engine, SessionLocal
 from rss_parser import RSSIngestionService
+import llm
+import ai_access
+import admin_digest
+import threat_summary
 
 logger = logging.getLogger("vnotice")
 
@@ -36,8 +41,36 @@ _SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 0
 # dashboard's default view shared across operators/auto-refresh — skip the DB
 # read and the Pydantic serialization of thousands of rows. Cleared on writes.
 _CVE_LIST_ADAPTER = TypeAdapter(List[schemas.CVEResponse])
-_CVES_CACHE: dict = {}     # query-string -> (timestamp, body_bytes)
-_CVES_TTL = 20.0
+_CVES_CACHE: dict = {}     # query-string -> (timestamp, body_bytes, gzipped_body_bytes)
+# Every write that changes the list (sync, EPSS refresh, checkpoint clear) clears
+# the cache explicitly, so the TTL is only a safety net -- long enough that 100
+# users aren't forced into a rebuild every few seconds.
+_CVES_TTL = 300.0
+# One lock per query: on a miss, a single request rebuilds while the rest wait
+# for its result. Without this, every user who hit the page right after a cache
+# clear rebuilt the same ~9MB response at once -- load-tested: 20 simultaneous
+# misses took 36-43s each (CPU-bound serialization queued behind the GIL).
+_CVES_LOCKS: dict = {}
+
+# ponytail: fixed-window rate limit, in-process dict -- fine since uvicorn runs
+# as a single worker here (no --workers flag), so there's only one process's
+# state to keep consistent. Guards /token and /users/ against unlimited
+# password-guessing / mass-registration now that there's a real login UI.
+_RATE_LIMIT_BUCKETS: dict = {}   # (bucket, client_ip) -> [timestamps]
+
+
+def _enforce_rate_limit(request: Request, bucket: str, max_attempts: int, window_seconds: float):
+    ip = request.client.host if request.client else "unknown"
+    key = (bucket, ip)
+    now = _time.time()
+    hits = [t for t in _RATE_LIMIT_BUCKETS.get(key, []) if now - t < window_seconds]
+    if len(hits) >= max_attempts:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Too many attempts. Try again in {int(window_seconds - (now - hits[0]))}s.",
+        )
+    hits.append(now)
+    _RATE_LIMIT_BUCKETS[key] = hits
 
 # Create all tables on startup
 models.Base.metadata.create_all(bind=engine)
@@ -70,6 +103,18 @@ def _ensure_columns():
                 logger.warning(f"migration: could not add {table.name}.{col.name}: {e}")
 
 _ensure_columns()
+
+# One-time copy of details extracted before the cve_insights table existed
+# (they lived in extra columns on cves). INSERT OR IGNORE: never overwrites.
+if engine.dialect.name == "sqlite":
+    with engine.begin() as _c:
+        _c.exec_driver_sql("""
+            INSERT OR IGNORE INTO cve_insights (cve_id, affected_versions, affected_conditions, mitigation,
+                remediation, fixed_versions, iocs, extracted_at, ai_verification, ai_checked_at)
+            SELECT cve_id, affected_versions, affected_conditions, mitigation, remediation, fixed_versions,
+                iocs, details_fetched_at, details_verification,
+                CASE WHEN details_verification IS NOT NULL THEN details_fetched_at END
+            FROM cves WHERE details_fetched_at IS NOT NULL GROUP BY cve_id""")
 
 # Fail-safe: if the DB is empty but per-source files exist, rebuild the DB from
 # them (e.g. after a lost/corrupt cvedb.sqlite). Files are the durable copy.
@@ -115,9 +160,11 @@ app.add_middleware(
 
 @app.post("/token", response_model=schemas.Token)
 async def login_for_access_token(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
+    _enforce_rate_limit(request, "token", max_attempts=5, window_seconds=60)
     user = db.query(models.User).filter(models.User.email == form_data.username).first()
     if not user or not auth.verify_password(form_data.password, user.password_hash):
         raise HTTPException(
@@ -137,7 +184,8 @@ async def login_for_access_token(
 # ─────────────────────────────────────────
 
 @app.post("/users/", response_model=schemas.UserResponse, status_code=status.HTTP_201_CREATED)
-def create_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+def create_user(request: Request, user: schemas.UserCreate, db: Session = Depends(get_db)):
+    _enforce_rate_limit(request, "register", max_attempts=5, window_seconds=60)
     db_user = db.query(models.User).filter(models.User.email == user.email).first()
     if db_user:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -234,10 +282,31 @@ def get_cves(
 ):
     # ponytail: serve a recent identical query straight from cache (see _CVES_CACHE).
     cache_key = str(request.url.query)
-    _now = _time.time()
+    wants_gzip = "gzip" in request.headers.get("accept-encoding", "")
+
+    def _serve(hit):
+        # The ~9MB list gzips ~5x; it's compressed once at build time and reused,
+        # so 100 users cost ~2MB each over the network instead of ~9MB, with no
+        # per-request compression CPU.
+        if wants_gzip:
+            return Response(content=hit[2], media_type="application/json",
+                            headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+        return Response(content=hit[1], media_type="application/json", headers={"Vary": "Accept-Encoding"})
+
     _hit = _CVES_CACHE.get(cache_key)
-    if _hit and _now - _hit[0] < _CVES_TTL:
-        return Response(content=_hit[1], media_type="application/json")
+    if _hit and _time.time() - _hit[0] < _CVES_TTL:
+        return _serve(_hit)
+    if len(_CVES_LOCKS) > 256:
+        _CVES_LOCKS.clear()              # bound memory; worst case two builds race once
+    with _CVES_LOCKS.setdefault(cache_key, threading.Lock()):
+        _hit = _CVES_CACHE.get(cache_key)   # someone may have built it while we waited
+        if _hit and _time.time() - _hit[0] < _CVES_TTL:
+            return _serve(_hit)
+        return _build_cves_response(cache_key, db, skip, limit, severity, vendor, product, search, days, _serve)
+
+
+def _build_cves_response(cache_key, db, skip, limit, severity, vendor, product, search, days, _serve):
+    _now = _time.time()
     try:
         query = db.query(models.CVE)
 
@@ -263,8 +332,9 @@ def get_cves(
         body = _CVE_LIST_ADAPTER.dump_json([schemas.CVEResponse.model_validate(r) for r in rows])
         if len(_CVES_CACHE) > 64:        # bound memory from varied filter combos
             _CVES_CACHE.clear()
-        _CVES_CACHE[cache_key] = (_now, body)
-        return Response(content=body, media_type="application/json")
+        hit = (_now, body, gzip.compress(body, 6))
+        _CVES_CACHE[cache_key] = hit
+        return _serve(hit)
     except Exception as exc:
         # Fail-safe: DB unavailable — serve from per-source files (degraded filtering).
         logger.error(f"/cves/ DB query failed, serving from source files: {exc}")
@@ -274,12 +344,157 @@ def get_cves(
         )
 
 
+@app.get("/cves/products")
+def get_cve_products(db: Session = Depends(get_db)):
+    """Distinct (source, product) combinations across the WHOLE table, not
+    just whatever falls inside the display window. Powers the Filter by
+    Source & Product panel's list of options -- a product doesn't disappear
+    from the picker just because every CVE that has it happens to be older
+    than the default 30-day view. Cheap: a GROUP BY, not full CVE rows.
+    Must be registered before /cves/{cve_id} or FastAPI would treat
+    "products" as a cve_id.
+    """
+    from sqlalchemy import func
+    rows = (
+        db.query(models.CVE.rss_source, models.CVE.product, func.count().label("count"))
+        .filter(models.CVE.product.isnot(None))
+        .group_by(models.CVE.rss_source, models.CVE.product)
+        .all()
+    )
+    return [{"source": r[0], "product": r[1], "count": r[2]} for r in rows]
+
+
 @app.get("/cves/{cve_id}", response_model=schemas.CVEResponse)
 def get_cve(cve_id: str, db: Session = Depends(get_db)):
     cve = db.query(models.CVE).filter(models.CVE.cve_id == cve_id).first()
     if not cve:
         raise HTTPException(status_code=404, detail="CVE not found")
     return cve
+
+
+@app.get("/cves/{cve_id}/details")
+def get_cve_details(cve_id: str, db: Session = Depends(get_db)):
+    """Affected versions / conditions / mitigation / remediation / fixed versions /
+    IOCs for one CVE number, plus its AI summary + verification, from the
+    cve_insights table. Extracted from CVE.org on first open if the background
+    Threat Summary job hasn't reached it (or it's over 7 days old)."""
+    if not db.query(models.CVE.cve_id).filter(models.CVE.cve_id == cve_id).first():
+        raise HTTPException(status_code=404, detail="CVE not found")
+    ins = threat_summary.extract(db, cve_id)
+    return threat_summary.public(ins, cve_id)
+
+
+@app.post("/cves/{cve_id}/verify")
+def verify_cve_details(cve_id: str, db: Session = Depends(get_db)):
+    """AI summary + per-field check of the extracted details against the raw
+    CVE.org record (threat_summary.ai_check). Suggestions are shown alongside the
+    extraction, never written over it -- a human decides."""
+    if not db.query(models.CVE.cve_id).filter(models.CVE.cve_id == cve_id).first():
+        raise HTTPException(status_code=404, detail="CVE not found")
+    try:
+        ins = threat_summary.ai_check(db, cve_id)
+    except threat_summary.CheckError as e:
+        msg = str(e)
+        raise HTTPException(status_code=502 if msg.startswith("AI check failed") else 409, detail=msg)
+    return threat_summary.public(ins, cve_id)
+
+
+# ─── Threat Summary Management (threat_summary.py, vnotice-threat-summary.timer) ───
+
+@app.get("/settings/threat-summary")
+def get_threat_summary_settings(db: Session = Depends(get_db)):
+    return {**threat_summary.get_scope(db), "stats": threat_summary.stats(db)}
+
+
+@app.put("/settings/threat-summary")
+async def put_threat_summary_settings(request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    scope = threat_summary.save_scope(db, body.get("enabled", True), body.get("sources") or {})
+    logger.warning(f"threat summary scope saved ({len(scope['sources'])} source(s), enabled={scope['enabled']})")
+    return {**scope, "stats": threat_summary.stats(db)}
+
+
+_TS_RUNNING = threading.Lock()
+
+
+@app.post("/settings/threat-summary/run")
+def run_threat_summary_now(retry_failed: bool = False, db: Session = Depends(get_db)):
+    """Start one batch now in the background (the timer runs one every 10 min)."""
+    cleared = threat_summary.clear_errors(db) if retry_failed else 0
+    if not _TS_RUNNING.acquire(blocking=False):
+        return {"result": "a batch is already running"}
+
+    def _job():
+        try:
+            logger.warning(f"threat summary (manual): {threat_summary.run()}")
+        finally:
+            _TS_RUNNING.release()
+    threading.Thread(target=_job, daemon=True).start()
+    return {"result": f"batch started (up to {threat_summary.BATCH} CVEs)"
+                      + (f"; cleared {cleared} failed AI check(s) for retry" if cleared else "")}
+
+
+# ─── AI provider settings (same contract as Sabler's /api/settings/llm) ───
+
+@app.get("/settings/llm")
+def get_llm_settings():
+    """Everything the Settings page may show. The API key is never included."""
+    return llm.public_settings()
+
+
+@app.put("/settings/llm")
+async def put_llm_settings(request: Request):
+    body = await request.json()
+    try:
+        llm.save(body.get("provider", ""), body.get("model", ""), body.get("api_key", ""), body.get("verify_model", ""))
+    except llm.LLMError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    logger.warning(f"AI provider settings saved (provider={body.get('provider')})")
+    return llm.public_settings()
+
+
+@app.delete("/settings/llm")
+def delete_llm_key():
+    llm.remove_key()
+    logger.warning("AI provider key removed")
+    return llm.public_settings()
+
+
+@app.post("/settings/llm/test")
+def test_llm_key():
+    try:
+        return {"reply": llm.test()}
+    except llm.LLMError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ─── Admin 10-minute summary (admin_digest.py, vnotice-admin-digest.timer) ───
+
+@app.get("/settings/admin-digest")
+def get_admin_digest_settings():
+    """Webhook URLs are secrets: only their last 6 characters are ever returned."""
+    return admin_digest.public_settings()
+
+
+@app.put("/settings/admin-digest")
+async def put_admin_digest_settings(request: Request):
+    body = await request.json()
+    webhooks = [u.strip() for u in body.get("webhooks", []) if isinstance(u, str) and u.strip()]
+    for u in webhooks:
+        _validate_teams_webhook(u)   # same allowlist as user Teams alerts: no arbitrary hosts
+    if body.get("keep_existing") and not webhooks:
+        webhooks = admin_digest._webhooks()
+    admin_digest.save(webhooks, body.get("enabled", True))
+    logger.warning(f"admin digest settings saved ({len(webhooks)} webhook(s), enabled={body.get('enabled', True)})")
+    return admin_digest.public_settings()
+
+
+@app.post("/settings/admin-digest/test")
+def test_admin_digest():
+    try:
+        return {"result": admin_digest.run(test=True)}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not post to the webhook: {e}")
 
 
 # ─────────────────────────────────────────
@@ -384,13 +599,68 @@ def _infer_vendor_product(feed_name: str, title: str):
     return "Various", "Various"
 
 
-async def _evaluate_triggers(user_id: str = "", db_url: str = ""):
-    """After a sync, check if any new CVEs match users' notification triggers and
-    fire alerts on the configured channels. Runs as a background task.
+def _trigger_matches(trigger, cve) -> bool:
+    if trigger.keyword and trigger.keyword.lower() not in (
+        (cve.title or "") + " " + (cve.description or "")
+    ).lower():
+        return False
+    if trigger.vendor and trigger.vendor.lower() not in (cve.vendor or "").lower():
+        return False
+    if trigger.product and trigger.product.lower() not in (cve.product or "").lower():
+        return False
+    if trigger.feed_source and trigger.feed_source.strip().lower() != (cve.rss_source or "").strip().lower():
+        return False
+    if trigger.min_severity and _SEVERITY_ORDER.get((cve.severity or "").lower(), 0) < \
+            _SEVERITY_ORDER.get(trigger.min_severity.lower(), 0):
+        return False
+    if trigger.min_cvss_score is not None and (cve.cvss_score or 0) < float(trigger.min_cvss_score):
+        return False
+    return True
 
-    An empty user_id means "every user that has triggers". The hourly auto-sync
-    authenticates as the auto-sync@vnotice.local service account, which owns no
-    triggers, so scoping this to the syncing user would never alert anybody.
+
+def _alert_email(cve):
+    sev = (cve.severity or "Medium").upper()
+    ref = cve.reference_url or ""
+    desc = (cve.description or "")[:300]
+    epss_str = f"{cve.epss * 100:.2f}%" if cve.epss is not None else "N/A"
+    cvss_str = f"{cve.cvss_score:.1f}" if cve.cvss_score is not None else "N/A"
+    published_str = cve.published_date.strftime("%Y-%m-%d") if cve.published_date else "N/A"
+    subject = f"[Vnotice Alert] {cve.cve_id} — {sev}"
+    body = (
+        '<html><body style="font-family:sans-serif">'
+        f'<h2 style="color:#c0392b">🚨 CVE Alert: {cve.cve_id}</h2><table>'
+        f'<tr><td><b>Title</b></td><td>{cve.title or cve.cve_id}</td></tr>'
+        f'<tr><td><b>Severity</b></td><td>{sev}</td></tr>'
+        f'<tr><td><b>CVSS</b></td><td>{cvss_str}</td></tr>'
+        f'<tr><td><b>EPSS</b></td><td>{epss_str}</td></tr>'
+        f'<tr><td><b>Published</b></td><td>{published_str}</td></tr>'
+        + (f'<tr><td><b>Description</b></td><td>{desc}</td></tr>' if desc else '')
+        + (f'<tr><td><b>Reference</b></td><td><a href="{ref}">{ref}</a></td></tr>' if ref else '')
+        + '</table></body></html>'
+    )
+    return subject, body
+
+
+def _dest_hash(dest: str) -> str:
+    import hashlib
+    return hashlib.sha256(dest.encode("utf-8")).hexdigest()
+
+
+async def _evaluate_triggers(user_id: str = "", db_url: str = ""):
+    """After a sync, alert every user whose triggers match a newly added CVE.
+    Runs as a background task.
+
+    Matching happens across ALL users first, then delivery is per destination:
+      * each user gets a CVE at most once, however many of their triggers match
+        it and however many feeds it arrived from;
+      * everyone subscribed to the same CVE via the same mail account gets ONE
+        email with all of them as (Bcc) recipients, not one email each;
+      * a webhook shared by several users is posted to once;
+      * every delivery is recorded in sent_alerts and checked first, so an
+        overlapping sync never re-sends it.
+
+    An empty user_id means "every user that has triggers" -- the hourly auto-sync
+    runs as a service account that owns no triggers itself.
     """
     import logging as _log
     _logger = _log.getLogger(__name__)
@@ -399,114 +669,102 @@ async def _evaluate_triggers(user_id: str = "", db_url: str = ""):
         uids = [user_id] if user_id else [
             str(r[0]) for r in db.query(models.NotificationTrigger.user_id).distinct().all()
         ]
-        if not uids:
-            return
-
-        # Only look at CVEs added in the last 10 minutes
         recent_cutoff = datetime.utcnow() - timedelta(minutes=10)
-        recent_cves = db.query(models.CVE).filter(
-            models.CVE.created_at >= recent_cutoff
-        ).all()
-        if not recent_cves:
+        recent_cves = db.query(models.CVE).filter(models.CVE.created_at >= recent_cutoff).all()
+        if not uids or not recent_cves:
             return
 
+        users = []
         for uid in uids:
-            await _evaluate_user_triggers(db, uid, recent_cves, _logger)
+            cfg = db.query(models.UserConfig).filter(models.UserConfig.user_id == uid).first()
+            trigs = db.query(models.NotificationTrigger).filter(models.NotificationTrigger.user_id == uid).all()
+            if cfg and trigs:
+                users.append((cfg, trigs))
+
+        # cve_id -> (a representative CVE row, [config of each matched user]); one entry per CVE ID
+        matched = {}
+        for cve in recent_cves:
+            for cfg, trigs in users:
+                if any(_trigger_matches(t, cve) for t in trigs):
+                    _, cfgs = matched.setdefault(cve.cve_id, (cve, []))
+                    if cfg not in cfgs:
+                        cfgs.append(cfg)
+        if not matched:
+            return
+
+        already = {(r.cve_id, r.channel, r.dest_hash) for r in db.query(models.SentAlert).filter(
+            models.SentAlert.cve_id.in_(list(matched))).all()}
+
+        def _is_new(cve_id, channel, dest):
+            return (cve_id, channel, _dest_hash(dest)) not in already
+
+        def _record(cve_id, channel, dest):
+            db.add(models.SentAlert(cve_id=cve_id, channel=channel, dest_hash=_dest_hash(dest)))
+            already.add((cve_id, channel, _dest_hash(dest)))
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            async def _post_ok(url, **kw):
+                resp = await client.post(url, **kw)
+                resp.raise_for_status()   # a 4xx/5xx is a failed delivery, not a success
+
+            for cve_id, (cve, cfgs) in matched.items():
+                kw = dict(
+                    title=cve.title or cve.cve_id, severity=cve.severity or "Medium", cve_id=cve.cve_id,
+                    description=(cve.description or "")[:300], reference_url=cve.reference_url,
+                    epss=cve.epss, cvss_score=cve.cvss_score, published_date=cve.published_date,
+                )
+
+                # Distinct webhook-style destinations across every matched user.
+                hooks = {}   # (channel, destination) -> (url, request kwargs)
+                for cfg in cfgs:
+                    if cfg.notify_teams and cfg.teams_webhook:
+                        hooks[("teams", cfg.teams_webhook)] = (cfg.teams_webhook, {"json": _build_teams_card(**kw)})
+                    if cfg.notify_discord and cfg.discord_webhook:
+                        hooks[("discord", cfg.discord_webhook)] = (cfg.discord_webhook, {"json": _build_discord_payload(**kw)})
+                    if cfg.notify_telegram and cfg.telegram_bot_token and cfg.telegram_chat_id:
+                        hooks[("telegram", f"{cfg.telegram_bot_token}|{cfg.telegram_chat_id}")] = (
+                            f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
+                            {"json": {"chat_id": cfg.telegram_chat_id, "text": _build_telegram_text(**kw), "parse_mode": "HTML"}})
+                    if cfg.notify_line and cfg.line_channel_token:
+                        hooks[("line", cfg.line_channel_token)] = (
+                            "https://api.line.me/v2/bot/message/broadcast",
+                            {"headers": {"Authorization": f"Bearer {cfg.line_channel_token}"},
+                             "json": {"messages": [{"type": "text", "text": _build_line_text(**kw)}]}})
+
+                for (channel, dest), (url, req) in hooks.items():
+                    if not _is_new(cve_id, channel, dest):
+                        continue
+                    try:
+                        await _post_ok(url, **req)
+                        _record(cve_id, channel, dest)
+                        _logger.warning(f"alert sent: {cve_id} via {channel}")
+                    except Exception as exc:
+                        _logger.error(f"Trigger alert failed for {cve_id} via {channel}: {exc!r}")
+
+                # Email: ONE message per sending mail account, with all its recipients together.
+                mail_groups = {}   # (host, port, user) -> [password, [recipients]]
+                for cfg in cfgs:
+                    if cfg.notify_email and cfg.smtp_host and cfg.smtp_username and cfg.smtp_password and cfg.smtp_to_address:
+                        group = mail_groups.setdefault((cfg.smtp_host, cfg.smtp_port or 587, cfg.smtp_username),
+                                                       [cfg.smtp_password, []])
+                        to = cfg.smtp_to_address.strip()
+                        if to not in group[1] and _is_new(cve_id, "email", to.lower()):
+                            group[1].append(to)
+                subject, body = _alert_email(cve)
+                for (host, port, user), (pw, recipients) in mail_groups.items():
+                    if not recipients:
+                        continue
+                    try:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, _send_smtp, host, port, user, pw, recipients, subject, body)
+                        for to in recipients:
+                            _record(cve_id, "email", to.lower())
+                        _logger.warning(f"alert sent: {cve_id} via email, one message to {len(recipients)} recipient(s)")
+                    except Exception as exc:
+                        _logger.error(f"Trigger alert failed for {cve_id} via email: {exc!r}")
+                db.commit()
     finally:
         db.close()
-
-
-async def _evaluate_user_triggers(db, user_id, recent_cves, _logger):
-    """Match `recent_cves` against one user's triggers and alert on every hit."""
-    cfg = db.query(models.UserConfig).filter(models.UserConfig.user_id == user_id).first()
-    triggers = db.query(models.NotificationTrigger).filter(
-        models.NotificationTrigger.user_id == user_id
-    ).all()
-    if not triggers or not cfg:
-        return
-
-    for cve in recent_cves:
-        for trigger in triggers:
-            matched = True
-            if trigger.keyword and trigger.keyword.lower() not in (
-                (cve.title or "") + " " + (cve.description or "")
-            ).lower():
-                matched = False
-            if trigger.vendor and trigger.vendor.lower() not in (cve.vendor or "").lower():
-                matched = False
-            if trigger.product and trigger.product.lower() not in (cve.product or "").lower():
-                matched = False
-            if trigger.feed_source and trigger.feed_source.strip().lower() != (
-                cve.rss_source or ""
-            ).strip().lower():
-                matched = False
-            if trigger.min_severity:
-                if _SEVERITY_ORDER.get((cve.severity or "").lower(), 0) < \
-                   _SEVERITY_ORDER.get(trigger.min_severity.lower(), 0):
-                    matched = False
-            if trigger.min_cvss_score is not None:
-                if (cve.cvss_score or 0) < float(trigger.min_cvss_score):
-                    matched = False
-            if not matched:
-                continue
-
-            # Fire on every enabled channel
-            alert_kwargs = dict(
-                title=cve.title or cve.cve_id,
-                severity=cve.severity or "Medium",
-                cve_id=cve.cve_id,
-                description=(cve.description or "")[:300],
-                reference_url=cve.reference_url,
-                epss=cve.epss,
-                cvss_score=cve.cvss_score,
-            )
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    if cfg.notify_teams and cfg.teams_webhook:
-                        payload = _build_teams_card(**alert_kwargs)
-                        await client.post(cfg.teams_webhook, json=payload)
-                    if cfg.notify_discord and cfg.discord_webhook:
-                        payload = _build_discord_payload(**alert_kwargs)
-                        await client.post(cfg.discord_webhook, json=payload)
-                    if cfg.notify_telegram and cfg.telegram_bot_token and cfg.telegram_chat_id:
-                        text_body = _build_telegram_text(**alert_kwargs)
-                        await client.post(
-                            f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
-                            json={"chat_id": cfg.telegram_chat_id, "text": text_body, "parse_mode": "HTML"},
-                        )
-                    if cfg.notify_line and cfg.line_channel_token:
-                        await client.post(
-                            "https://api.line.me/v2/bot/message/broadcast",
-                            headers={"Authorization": f"Bearer {cfg.line_channel_token}"},
-                            json={"messages": [{"type": "text", "text": _build_line_text(**alert_kwargs)}]},
-                        )
-                    if (cfg.notify_email and cfg.smtp_host and cfg.smtp_username
-                            and cfg.smtp_password and cfg.smtp_to_address):
-                        sev = (cve.severity or "Medium").upper()
-                        ref = cve.reference_url or ""
-                        desc = (cve.description or "")[:300]
-                        epss_str = f"{cve.epss * 100:.2f}%" if cve.epss is not None else "N/A"
-                        cvss_str = f"{cve.cvss_score:.1f}" if cve.cvss_score is not None else "N/A"
-                        subject = f"[Vnotice Alert] {cve.cve_id} — {sev}"
-                        body = (
-                            '<html><body style="font-family:sans-serif">'
-                            f'<h2 style="color:#c0392b">🚨 CVE Alert: {cve.cve_id}</h2><table>'
-                            f'<tr><td><b>Title</b></td><td>{cve.title or cve.cve_id}</td></tr>'
-                            f'<tr><td><b>Severity</b></td><td>{sev}</td></tr>'
-                            f'<tr><td><b>CVSS</b></td><td>{cvss_str}</td></tr>'
-                            f'<tr><td><b>EPSS</b></td><td>{epss_str}</td></tr>'
-                            + (f'<tr><td><b>Description</b></td><td>{desc}</td></tr>' if desc else '')
-                            + (f'<tr><td><b>Reference</b></td><td><a href="{ref}">{ref}</a></td></tr>' if ref else '')
-                            + '</table></body></html>'
-                        )
-                        # _send_smtp is blocking — run it off the event loop.
-                        await asyncio.get_event_loop().run_in_executor(
-                            None, _send_smtp, cfg.smtp_host, cfg.smtp_port or 587,
-                            cfg.smtp_username, cfg.smtp_password, cfg.smtp_to_address,
-                            subject, body,
-                        )
-            except Exception as exc:
-                _logger.error(f"Trigger alert failed for {cve.cve_id}: {exc}")
 
 
 @app.post("/sync/", response_model=schemas.SyncResponse)
@@ -594,7 +852,20 @@ def sync_threat_sources(
                 _insert_items(RSSIngestionService.fetch_nvd_by_cpe(cpe), feed.name)
             continue
         if "services.nvd.nist.gov" in feed.url:
-            _insert_items(RSSIngestionService.fetch_nvd_api(), feed.name)
+            # fetch_nvd_api's own CPE-based lookup only succeeds once NVD has
+            # analysed a CVE (added Known Affected Software Configurations),
+            # which lags initial publication -- so brand-new CVEs come back
+            # "Various"/"Various" by construction, not by bug. Fall back to
+            # the same title-keyword heuristic the generic RSS path already
+            # uses, so a recognisable product (WordPress, Apache, GitLab, ...)
+            # isn't left generic just because NVD hasn't gotten to it yet.
+            nvd_items = RSSIngestionService.fetch_nvd_api()
+            for it in nvd_items:
+                if it["vendor"] == "Various" and it["product"] == "Various":
+                    v, p = _infer_vendor_product(feed.name, it["title"])
+                    if v != "Various":
+                        it["vendor"], it["product"] = v, p
+            _insert_items(nvd_items, feed.name)
             continue
         if "advisory.splunk.com" in feed.url:
             _insert_items(RSSIngestionService.fetch_splunk_advisories(), feed.name)
@@ -633,13 +904,17 @@ def sync_threat_sources(
             key = (item["cve_id"], feed.name)
             if key not in existing_pairs:
                 vendor, product = _infer_vendor_product(feed.name, item["title"])
+                # This feed carries no CVSS data of its own — look the CVE up
+                # in the NVD (the authoritative source) instead of guessing.
+                nvd = RSSIngestionService.fetch_nvd_details(item["cve_id"])
+                real_epss = RSSIngestionService.fetch_real_epss_score(item["cve_id"])
                 record = {
                     "cve_id": item["cve_id"],
                     "title": item["title"],
                     "description": item["description"],
-                    "severity": random.choice(["Medium", "High", "Critical"]),
-                    "cvss_score": round(random.uniform(5.0, 9.8), 1),
-                    "epss": round(random.uniform(0.01, 0.95), 4),
+                    "severity": nvd["severity"] if nvd else None,
+                    "cvss_score": nvd["cvss_score"] if nvd else None,
+                    "epss": real_epss if real_epss > 0 else None,
                     "published_date": item["published_date"],
                     "updated_date": item["published_date"],
                     "vendor": vendor,
@@ -690,20 +965,52 @@ def sync_threat_sources(
             for r in recs:
                 r["epss"] = epss_scores.get((r["cve_id"] or "").upper())
 
+    # Retry EPSS for previously-null CVEs too -- the block above only covers
+    # rows inserted THIS sync. A CVE too new for EPSS at insert time would
+    # otherwise stay "N/A" forever, since nothing else ever re-checks it,
+    # short of someone manually clicking "Refresh Missing EPSS" in Settings.
+    # Re-querying here every hour means it self-heals once FIRST.org actually
+    # scores it (most stay null because NVD rejected the CVE, which is a
+    # real, permanent N/A -- this just stops silently missing the ones that
+    # do get scored later).
+    stale_null = db.query(models.CVE).filter(
+        models.CVE.epss.is_(None), models.CVE.cve_id.like("CVE-%")
+    ).all()
+    if stale_null:
+        retry_scores = RSSIngestionService.fetch_epss_batch([r.cve_id for r in stale_null])
+        for r in stale_null:
+            val = retry_scores.get((r.cve_id or "").upper())
+            if val is not None:
+                r.epss = val
+
+    # Same idea for "Various"/"Various" NVD CVEs, but via the single-CVE NVD
+    # lookup (fetch_nvd_details), not the batched EPSS one -- NVD only knows a
+    # CVE's real vendor/product once its own analysts add CPE ("Known
+    # Affected Software Configurations") data, which lags publication. A CVE
+    # too new for that at insert time gets a real product name automatically
+    # the moment NVD adds it, no keyword list to maintain and no manual
+    # re-sync needed. Capped per run (one HTTP call each, unlike the batched
+    # EPSS retry) so a large backlog can't turn every hourly sync into a
+    # multi-minute run or trip NVD's rate limit -- it works through the
+    # backlog gradually, oldest-discovered first.
+    stale_various = db.query(models.CVE).filter(
+        models.CVE.vendor == "Various", models.CVE.rss_source == "NVD / NIST CVE"
+    ).order_by(models.CVE.created_at.asc()).limit(30).all()
+    for r in stale_various:
+        nvd = RSSIngestionService.fetch_nvd_details(r.cve_id)
+        if nvd and nvd.get("vendor") and nvd["vendor"] != "Various":
+            r.vendor, r.product = nvd["vendor"], nvd["product"]
+
     # Fail-safe: write each source's CVEs to its per-source file BEFORE the DB
     # commit, so the durable copy survives even if the commit fails.
     for src, recs in synced_by_source.items():
         source_store.write_source(src, recs)
 
-    # Retention sweep: every sync (hourly, via the autosync timer) re-checks
-    # published_date on the whole table and drops anything that has aged past
-    # the 30-day window -- not just what this run touched.
-    purged = db.query(models.CVE).filter(
-        models.CVE.published_date < thirty_days_ago
-    ).delete(synchronize_session=False)
-    if purged:
-        logger.warning(f"retention sweep: purged {purged} CVE(s) older than 30 days")
-        _CVES_CACHE.clear()
+    # No hard-delete retention sweep -- the database keeps every CVE it has
+    # ever ingested (needed so the Centralize integration sync can pull older
+    # findings without a race against a purge). "30 days" is a DISPLAY
+    # default only, enforced by the `days` query param on GET /cves/, not by
+    # deleting rows -- older data is still there for anyone who asks for it.
 
     # Persist feed/scraper config to UserConfig so other clients can load it
     cfg = _get_or_create_config(current_user, db)
@@ -936,15 +1243,18 @@ def resource_usage_history():
 
 @app.post("/cves/refresh-epss")
 def refresh_epss(db: Session = Depends(get_db)):
-    """Backfill REAL EPSS scores from FIRST.org for every stored CVE (batched).
-    CVEs the API has no score for are set to None (displayed as N/A)."""
-    rows = db.query(models.CVE).all()
+    """Backfill REAL EPSS scores from FIRST.org (batched) for CVEs still N/A
+    -- the dashboard's "Refresh N/A EPSS" button. Already-scored CVEs are never
+    re-queried; a CVE FIRST.org still has no score for stays None."""
+    rows = db.query(models.CVE).filter(models.CVE.epss.is_(None)).all()
+    if not rows:
+        return {"total": 0, "with_epss": 0, "na": 0}
     scores = RSSIngestionService.fetch_epss_batch([r.cve_id for r in rows])
     found = 0
     for r in rows:
         val = scores.get((r.cve_id or "").upper())
-        r.epss = val
         if val is not None:
+            r.epss = val
             found += 1
     db.commit()
     _CVES_CACHE.clear()   # ponytail: epss updated ⇒ drop the /cves/ response cache
@@ -978,7 +1288,8 @@ def _validate_teams_webhook(url: str) -> None:
 
 def _build_teams_card(title: str, severity: str, cve_id: str,
                       description: Optional[str], reference_url: Optional[str],
-                      epss: Optional[float] = None, cvss_score: Optional[float] = None) -> dict:
+                      epss: Optional[float] = None, cvss_score: Optional[float] = None,
+                      published_date: Optional[datetime] = None) -> dict:
     # The Teams Workflow ("Post card when a webhook request is received") requires
     # an Adaptive Card wrapped in the attachments envelope below — a plain
     # {"text": ...} body is accepted at HTTP level (202) but the flow then fails
@@ -990,6 +1301,8 @@ def _build_teams_card(title: str, severity: str, cve_id: str,
         facts.append({"title": "CVSS", "value": f"{cvss_score:.1f}"})
     if epss is not None:
         facts.append({"title": "EPSS", "value": f"{epss * 100:.2f}%"})
+    if published_date is not None:
+        facts.append({"title": "Published", "value": published_date.strftime("%Y-%m-%d")})
     body = [{"type": "TextBlock", "text": f"🚨 {title}", "weight": "bolder",
              "size": "medium", "color": color, "wrap": True}]
     if description:
@@ -1019,7 +1332,8 @@ async def send_teams_alert(req: schemas.TeamsAlertRequest):
     """Send a CVE alert to a Microsoft Teams channel via Incoming Webhook."""
     _validate_teams_webhook(req.webhook_url)
     payload = _build_teams_card(req.title, req.severity, req.cve_id,
-                                req.description, req.reference_url, req.epss, req.cvss_score)
+                                req.description, req.reference_url, req.epss, req.cvss_score,
+                                req.published_date)
     last_error = ""
     for attempt in range(1, 4):
         try:
@@ -1078,7 +1392,8 @@ _DISCORD_COLOR = {"critical": 15158332, "high": 16744272, "medium": 16776960, "l
 
 def _build_discord_payload(title: str, severity: str, cve_id: str,
                            description: Optional[str], reference_url: Optional[str],
-                           epss: Optional[float] = None, cvss_score: Optional[float] = None) -> dict:
+                           epss: Optional[float] = None, cvss_score: Optional[float] = None,
+                           published_date: Optional[datetime] = None) -> dict:
     color = _DISCORD_COLOR.get(severity.lower(), 9807270)
     embed: dict = {
         "title": f"[{cve_id}] {title}",
@@ -1140,7 +1455,8 @@ async def test_discord_webhook(
 
 def _build_telegram_text(title: str, severity: str, cve_id: str,
                           description: Optional[str], reference_url: Optional[str],
-                          epss: Optional[float] = None, cvss_score: Optional[float] = None) -> str:
+                          epss: Optional[float] = None, cvss_score: Optional[float] = None,
+                          published_date: Optional[datetime] = None) -> str:
     lines = [
         f"<b>🚨 [{cve_id}]</b> {title}",
         f"Severity: <b>{severity.upper()}</b>",
@@ -1174,7 +1490,8 @@ async def send_telegram_alert(
 
 def _build_line_text(title: str, severity: str, cve_id: str,
                      description: Optional[str], reference_url: Optional[str],
-                     epss: Optional[float] = None, cvss_score: Optional[float] = None) -> str:
+                     epss: Optional[float] = None, cvss_score: Optional[float] = None,
+                     published_date: Optional[datetime] = None) -> str:
     # LINE text messages are plain text (no HTML), 5000-char limit.
     lines = [f"🚨 [{cve_id}] {title}", f"Severity: {severity.upper()}"]
     if description:
@@ -1244,7 +1561,13 @@ def _smtp_auth_detail(exc: smtplib.SMTPAuthenticationError) -> str:
 
 
 def _send_smtp(host: str, port: int, username: str, password: str,
-               to_address: str, subject: str, body_html: str) -> None:
+               to_address, subject: str, body_html: str) -> None:
+    """to_address: one address, or a list -- several people subscribed to the same
+    product get ONE email, with each other's addresses hidden (Bcc)."""
+    recipients = [a for a in ([to_address] if isinstance(to_address, str) else list(to_address)) if (a or "").strip()]
+    if len(recipients) > 1:
+        return _send_smtp_bcc(host, port, username, password, recipients, subject, body_html)
+    to_address = recipients[0] if recipients else ""
     # Empty host makes smtplib skip connect() and later fail with the cryptic
     # "please run connect() first" — guard with a clear, actionable message.
     if not (host or "").strip():
@@ -1273,6 +1596,25 @@ def _send_smtp(host: str, port: int, username: str, password: str,
             server.sendmail(username, to_address, msg.as_string())
 
 
+def _send_smtp_bcc(host, port, username, password, recipients, subject, body_html):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = username
+    msg["To"] = "Vnotice subscribers <%s>" % username   # recipients go in the envelope only (Bcc)
+    msg.attach(MIMEText(body_html, "html"))
+    ctx = ssl.create_default_context()
+    if port == 465:
+        with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as server:
+            server.login(username, password)
+            server.sendmail(username, recipients, msg.as_string())
+    else:
+        with smtplib.SMTP(host, port, timeout=30) as server:
+            server.ehlo()
+            server.starttls(context=ctx)
+            server.login(username, password)
+            server.sendmail(username, recipients, msg.as_string())
+
+
 @app.post("/notifications/email", status_code=200)
 async def send_email_alert(
     req: schemas.EmailAlertRequest,
@@ -1281,6 +1623,7 @@ async def send_email_alert(
     subject = f"[Vnotice Alert] {req.cve_id} — {req.severity.upper()}"
     epss_str = f"{req.epss * 100:.2f}%" if req.epss is not None else "N/A"
     cvss_str = f"{req.cvss_score:.1f}" if req.cvss_score is not None else "N/A"
+    published_str = req.published_date.strftime("%Y-%m-%d") if req.published_date else None
     body = f"""
 <html><body style="font-family:sans-serif">
 <h2 style="color:#c0392b">🚨 CVE Alert: {req.cve_id}</h2>
@@ -1288,6 +1631,7 @@ async def send_email_alert(
 <tr><td><b>Severity</b></td><td>{req.severity.upper()}</td></tr>
 <tr><td><b>CVSS</b></td><td>{cvss_str}</td></tr>
 <tr><td><b>EPSS</b></td><td>{epss_str}</td></tr>
+{'<tr><td><b>Published</b></td><td>' + published_str + '</td></tr>' if published_str else ''}
 {'<tr><td><b>Description</b></td><td>' + (req.description or '') + '</td></tr>' if req.description else ''}
 {'<tr><td><b>Reference</b></td><td><a href="' + req.reference_url + '">' + req.reference_url + '</a></td></tr>' if req.reference_url else ''}
 </table>
@@ -1323,6 +1667,7 @@ async def test_email_config(
             f'<tr><td><b>Severity</b></td><td>{sev}</td></tr>'
             f'<tr><td><b>CVSS</b></td><td>{cvss_str}</td></tr>'
             f'<tr><td><b>EPSS</b></td><td>{epss_str}</td></tr>'
+            + (f'<tr><td><b>Published</b></td><td>{req.published_date}</td></tr>' if req.published_date else '')
             + (f'<tr><td><b>Description</b></td><td>{req.description}</td></tr>' if req.description else '')
             + (f'<tr><td><b>Reference</b></td><td><a href="{req.reference_url}">{req.reference_url}</a></td></tr>' if req.reference_url else '')
             + '</table></body></html>'

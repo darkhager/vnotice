@@ -1,10 +1,10 @@
 import urllib.request
 import urllib.parse
+import time
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Optional
-import random
 import logging
 import json
 
@@ -244,11 +244,143 @@ class RSSIngestionService:
             "description":    desc,
             "severity":       severity or "Medium",
             "cvss_score":     float(cvss_score) if cvss_score is not None else 5.0,
-            "epss":           epss if epss > 0 else round(random.uniform(0.01, 0.30), 4),
+            "epss":           epss if epss > 0 else None,
             "vendor":         vendor,
             "product":        product,
             "reference_url":  ref_url,
             "published_date": published_date,
+        }
+
+    @staticmethod
+    def fetch_nvd_details(cve_id: str) -> Optional[dict]:
+        """Look up one CVE ID directly against the NVD — the authoritative source
+        for CVSS/severity — for callers whose own source (a generic RSS feed, or
+        a regex-scraped page) carries no structured CVE data of its own.
+        Returns None if the NVD has no record for this ID yet (e.g. reserved but
+        not yet published); callers should store None rather than invent a value.
+        """
+        try:
+            url = f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}"
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+            vulns = data.get("vulnerabilities", [])
+            if not vulns:
+                return None
+            return RSSIngestionService._parse_nvd_vuln(vulns[0])
+        except Exception as e:
+            logger.error(f"NVD lookup failed for {cve_id}: {e}")
+            return None
+
+    @staticmethod
+    def fetch_cve_record(cve_id: str) -> Optional[dict]:
+        """The raw CVE JSON 5 record from CVE.org, or None (non-CVE id / failure)."""
+        if not re.fullmatch(r"CVE-\d{4}-\d+", cve_id or ""):
+            return None
+        try:
+            req = urllib.request.Request(f"https://cveawg.mitre.org/api/cve/{cve_id}",
+                                         headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            logger.error(f"CVE.org lookup failed for {cve_id}: {e}")
+            return None
+
+    @staticmethod
+    def cve_record_source_text(record: dict) -> str:
+        """The parts of a CVE.org record the details are extracted from, compacted
+        for the AI verifier: the vendor's own description, affected-version data,
+        configurations, workarounds and solutions (CNA container, plus any ADP
+        affected data). References/metrics are left out -- irrelevant here."""
+        containers = record.get("containers", {})
+        cna = containers.get("cna", {})
+        parts = {k: cna.get(k) for k in ("title", "descriptions", "affected", "configurations",
+                                         "workarounds", "solutions") if cna.get(k)}
+        adp_affected = [a.get("affected") for a in containers.get("adp", []) if a.get("affected")]
+        if adp_affected:
+            parts["adp_affected"] = adp_affected
+        return json.dumps(parts, ensure_ascii=False)[:12000]
+
+    @staticmethod
+    def fetch_cve_record_details(cve_id: str) -> Optional[dict]:
+        """Vendor-supplied specifics from the official CVE.org record (CVE JSON 5,
+        cveawg.mitre.org). The CNA -- usually the vendor itself -- fills these in
+        at publication, so unlike NVD's CPE data there's no analysis lag:
+          affected[].versions -> affected versions (+ fixed version via lessThan /
+                                 "unaffected" entries)
+          configurations      -> conditions required to be vulnerable
+          workarounds         -> mitigation
+          solutions           -> remediation
+        How much each vendor fills in varies (Splunk: all of it; Check Point:
+        affected versions only). Missing fields come back as None, never guessed.
+        Returns None if the ID has no CVE.org record (e.g. FG-IR / SVD ids) or
+        the lookup fails.
+        """
+        record = RSSIngestionService.fetch_cve_record(cve_id)
+        if record is None:
+            return None
+
+        containers = record.get("containers", {})
+        cna = containers.get("cna", {})
+
+        def _texts(entries):
+            vals = [e.get("value", "").strip() for e in (entries or [])
+                    if e.get("lang", "en").startswith("en") and e.get("value")]
+            return "\n\n".join(vals)[:4000] or None
+
+        # Some CNAs leave `affected` thin; CISA's ADP enrichment often fills it.
+        affected = cna.get("affected") or next(
+            (a.get("affected") for a in containers.get("adp", []) if a.get("affected")), [])
+
+        affected_lines, fixed = [], []
+        for a in affected:
+            name = " ".join(x for x in (a.get("vendor"), a.get("product")) if x and x != "n/a")
+            ranges = []
+            for v in a.get("versions") or []:
+                ver = (v.get("version") or "").strip()
+                if v.get("status") == "unaffected":
+                    # skip placeholders like "All" (e.g. "Linux: All -- unaffected"), not a version
+                    if ver and ver.lower() not in ("all", "*", "n/a", "0") and ver not in fixed:
+                        fixed.append(ver)
+                    continue
+                # some CNAs write the range as plain text ("< 26.5.2") instead of lessThan
+                m = re.fullmatch(r"<\s*([\w.\-]+)", ver)
+                if m and not v.get("lessThan") and m.group(1) not in fixed:
+                    fixed.append(m.group(1))
+                if v.get("lessThan"):
+                    ranges.append(f"< {v['lessThan']}" if ver in ("", "0", "*") else f"{ver} to < {v['lessThan']}")
+                    if v["lessThan"] not in fixed:
+                        fixed.append(v["lessThan"])
+                elif v.get("lessThanOrEqual"):
+                    ranges.append(f"<= {v['lessThanOrEqual']}" if ver in ("", "0", "*")
+                                  else f"{ver} to <= {v['lessThanOrEqual']}")
+                elif ver:
+                    ranges.append(ver)
+            if ranges:
+                affected_lines.append(f"{name}: " + "; ".join(ranges) if name else "; ".join(ranges))
+
+        # IOCs: CVE records rarely carry them, but when a CNA pastes file hashes or
+        # attacker IPs into the advisory text, surface them. Hashes are exact hex
+        # lengths (MD5/SHA-1/SHA-256); IPs need every octet <= 255 and must not
+        # look like a dotted version string ("version 10.2.4.1").
+        blob = " ".join(e.get("value", "") for key in ("descriptions", "workarounds", "solutions", "configurations")
+                        for e in (cna.get(key) or []))
+        iocs = []
+        for h in re.findall(r"\b(?:[a-fA-F0-9]{64}|[a-fA-F0-9]{40}|[a-fA-F0-9]{32})\b", blob):
+            if h.lower() not in iocs:
+                iocs.append(h.lower())
+        for m in re.finditer(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", blob):
+            ip, before = m.group(1), blob[max(0, m.start() - 12):m.start()].lower()
+            if all(int(o) <= 255 for o in ip.split(".")) and not re.search(r"(version|ver\.?|v)\s*$", before) and ip not in iocs:
+                iocs.append(ip)
+
+        return {
+            "iocs":                "\n".join(iocs)[:2000] or None,
+            "affected_versions":   "\n".join(affected_lines)[:4000] or None,
+            "affected_conditions": _texts(cna.get("configurations")),
+            "mitigation":          _texts(cna.get("workarounds")),
+            "remediation":         _texts(cna.get("solutions")),
+            "fixed_versions":      ", ".join(fixed)[:1000] or None,
         }
 
     @staticmethod
@@ -386,35 +518,22 @@ class RSSIngestionService:
         rows = re.split(r'<tr class="advisory-tr">', html)[1:]
         for row in rows:
             svd = _cell(row, "SVD")
-            cve_match = re.search(r"CVE-\d{4}-\d+", _cell(row, "CVE"))
-            if cve_match:
-                cve_id = cve_match.group(0)
-            elif svd.startswith("SVD-"):
-                # Some Splunk advisories (often third-party bundles) carry no parseable
-                # CVE in the table — fall back to the SVD id so they're still tracked.
-                cve_id = svd
-            else:
-                continue
-            title = _cell(row, "Title") or f"Splunk advisory {svd}"
+            cve_cell = _cell(row, "CVE")
+            cve_ids = re.findall(r"CVE-\d{4}-\d+", cve_cell)
 
-            severity = (_cell(row, "Severity") or "Medium").capitalize()
-            if severity not in ("Low", "Medium", "High", "Critical", "Informational"):
-                severity = "Medium"
-
-            try:
-                cvss_score = float(_cell(row, "CVSS Score"))
-            except (ValueError, TypeError):
-                cvss_score = 5.0
-
+            row_title = _cell(row, "Title") or f"Splunk advisory {svd}"
+            row_severity = (_cell(row, "Severity") or "Medium").capitalize()
+            if row_severity not in ("Low", "Medium", "High", "Critical", "Informational"):
+                row_severity = "Medium"
             vector = _cell(row, "CVSS Vector")
             cwe = _cell(row, "CWE")
             affected = _cell(row, "Affected Product")
 
-            # Derive product from the affected-product list (strip trailing version)
-            product = "Splunk Enterprise"
+            # Derive a default product from the affected-product list (strip trailing version)
+            default_product = "Splunk Enterprise"
             if affected:
                 first = affected.split(",")[0].strip()
-                product = re.sub(r"\s+[\d.]+$", "", first).strip() or "Splunk Enterprise"
+                default_product = re.sub(r"\s+[\d.]+$", "", first).strip() or "Splunk Enterprise"
 
             pub_raw = _cell(row, "Published")
             try:
@@ -422,31 +541,75 @@ class RSSIngestionService:
             except (ValueError, TypeError):
                 published_date = datetime.utcnow()
 
-            desc_parts = [title.rstrip(".") + "."]
-            if affected:
-                desc_parts.append(f"Affected products: {affected}.")
-            if vector:
-                desc_parts.append(f"CVSS vector {vector}.")
-            if cwe:
-                desc_parts.append(cwe + ".")
-            if svd:
-                desc_parts.append(f"Splunk advisory {svd}.")
-            description = " ".join(desc_parts)
-
             ref_url = f"https://advisory.splunk.com/advisories/{svd}" if svd.startswith("SVD-") else url
 
-            items.append({
-                "cve_id":         cve_id,
-                "title":          title[:200],
-                "description":    description,
-                "severity":       severity,
-                "cvss_score":     cvss_score,
-                "epss":           None,   # filled with real EPSS on sync; SVD ids stay N/A
-                "vendor":         "Splunk",
-                "product":        product[:100],
-                "reference_url":  ref_url,
-                "published_date": published_date,
-            })
+            if len(cve_ids) <= 1:
+                # Simple case: one advisory, one CVE (or none -- fall back to the SVD
+                # id so third-party bundles with no parseable CVE still get tracked).
+                # The row's own Severity/CVSS Score cells apply cleanly here.
+                cve_id = cve_ids[0] if cve_ids else (svd if svd.startswith("SVD-") else None)
+                if not cve_id:
+                    continue
+                try:
+                    cvss_score = float(_cell(row, "CVSS Score"))
+                except (ValueError, TypeError):
+                    cvss_score = 5.0
+                desc_parts = [row_title.rstrip(".") + "."]
+                if affected:
+                    desc_parts.append(f"Affected products: {affected}.")
+                if vector:
+                    desc_parts.append(f"CVSS vector {vector}.")
+                if cwe:
+                    desc_parts.append(cwe + ".")
+                if svd:
+                    desc_parts.append(f"Splunk advisory {svd}.")
+                items.append({
+                    "cve_id":         cve_id,
+                    "title":          row_title[:200],
+                    "description":    " ".join(desc_parts),
+                    "severity":       row_severity,
+                    "cvss_score":     cvss_score,
+                    "epss":           None,   # filled with real EPSS on sync; SVD ids stay N/A
+                    "vendor":         "Splunk",
+                    "product":        default_product[:100],
+                    "reference_url":  ref_url,
+                    "published_date": published_date,
+                })
+            else:
+                # Bundle advisory: the table packs multiple CVEs into one row, each
+                # with its own inline title inside the CVE cell -- but the shared
+                # Severity/CVSS Score/Affected Product cells don't map 1:1 onto them
+                # (seen live: one bundle listed 17 CVEs against only 11 CVSS
+                # numbers), so trusting position would silently attach the wrong
+                # score to the wrong CVE, and taking only the first CVE (the old
+                # behavior) silently dropped the other 16. Look each one up
+                # against the NVD instead -- same fallback the generic RSS/scraper
+                # paths use when a source carries no trustworthy per-CVE data of
+                # its own -- storing NULL rather than a guess if NVD has nothing yet.
+                segments = re.split(r"(CVE-\d{4}-\d+)", cve_cell)
+                for i in range(1, len(segments), 2):
+                    cid = segments[i]
+                    seg_title = segments[i + 1].strip() if i + 1 < len(segments) else ""
+                    nvd = RSSIngestionService.fetch_nvd_details(cid)
+                    prod_match = re.search(r"\bin\s+([A-Z][\w .()/-]*)$", seg_title)
+                    product = prod_match.group(1).strip() if prod_match else default_product
+                    desc_parts = [(seg_title or row_title).rstrip(".") + "."]
+                    desc_parts.append(f"Part of Splunk advisory {svd} ({row_title}).")
+                    items.append({
+                        "cve_id":         cid,
+                        "title":          (seg_title or row_title)[:200],
+                        "description":    " ".join(desc_parts),
+                        "severity":       nvd["severity"] if nvd else None,
+                        "cvss_score":     nvd["cvss_score"] if nvd else None,
+                        "epss":           None,
+                        "vendor":         "Splunk",
+                        "product":        product[:100],
+                        "reference_url":  ref_url,
+                        "published_date": published_date,
+                    })
+                    if len(items) >= max_advisories:
+                        break
+
             if len(items) >= max_advisories:
                 break
 
@@ -521,6 +684,15 @@ class RSSIngestionService:
             text = re.sub(r"Revised on[^<]*", "", text)
             text = re.sub(r"\s+", " ", text).strip() or title
 
+            # The advisory text names the real affected product (FortiGate,
+            # FortiManager, FortiSIEM, ...) -- every row was previously
+            # hardcoded to "FortiOS" regardless, which made a product filter
+            # meaningless. FortiGuard is Fortinet's own threat-intel brand,
+            # not a product being patched, so it's excluded.
+            product_names = [p for p in re.findall(r"\bForti[A-Za-z]+\b", f"{title} {text}")
+                            if p not in ("FortiGuard", "Fortinet")]
+            product = product_names[0] if product_names else "FortiOS"
+
             pub = parse_date(pub_m.group(1)) if pub_m else datetime.utcnow()
             if getattr(pub, "tzinfo", None):
                 pub = pub.replace(tzinfo=None)
@@ -533,7 +705,7 @@ class RSSIngestionService:
                 "cvss_score":     cvss_score,
                 "epss":           None,   # filled with real EPSS on sync; FG-IR ids stay N/A
                 "vendor":         "Fortinet",
-                "product":        "FortiOS",
+                "product":        product,
                 "reference_url":  (link_m.group(1).strip() if link_m else url),
                 "published_date": pub,
             })
@@ -563,12 +735,23 @@ class RSSIngestionService:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json",
         }
-        try:
-            req = urllib.request.Request(api, headers=headers)
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        except Exception as e:
-            logger.error(f"Error fetching Check Point advisories: {e}")
+        # Check Point's API is flaky enough (read timeouts, transient 500s, the
+        # occasional empty body) that a single attempt misses it on a real slice
+        # of hourly runs -- retry a couple of times before giving up on this feed.
+        data = None
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                req = urllib.request.Request(api, headers=headers)
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+        if data is None:
+            logger.error(f"Error fetching Check Point advisories after 3 attempts: {last_err}")
             return []
 
         if not isinstance(data, list):
@@ -631,7 +814,7 @@ class RSSIngestionService:
                 "description":    description,
                 "severity":       severity,
                 "cvss_score":     cvss_score,
-                "epss":           round(random.uniform(0.01, 0.30), 4),
+                "epss":           None,
                 "vendor":         "Check Point",
                 "product":        product[:100],
                 "reference_url":  ref_url,
@@ -706,7 +889,7 @@ class RSSIngestionService:
                 "description":    title,   # feed carries no body; the title is the summary
                 "severity":       severity,
                 "cvss_score":     sev_to_cvss.get(severity.lower(), 5.0),
-                "epss":           round(random.uniform(0.01, 0.30), 4),
+                "epss":           None,
                 "vendor":         "Palo Alto Networks",
                 "product":        product,
                 "reference_url":  link or "https://security.paloaltonetworks.com/",
@@ -1007,66 +1190,48 @@ class RSSIngestionService:
 
     @staticmethod
     def generate_cve_details_for_id(cve_id: str, source_name: str, source_url: str):
-        """Generate realistic CVE details for a discovered CVE ID."""
-        # Clean brand/product based on source name
-        vendor = "Unknown"
-        product = "Unknown Product"
-        title = f"Vulnerability in {product} ({cve_id})"
-        description = f"Security vulnerability identified on page '{source_name}'. Matching regex pattern successfully extracted this identifier."
-        
+        """Build CVE details for an ID discovered via regex page-scraping.
+
+        The source page itself carries no structured CVE data (that's why it
+        needed a regex scrape in the first place), so real title/description/
+        CVSS/severity come from the NVD lookup. Vendor/product are the one
+        thing legitimately inferred from which advisory page this came from;
+        if the NVD's own CPE match data disagrees, that takes precedence.
+        """
+        vendor, product = "Unknown", "Unknown Product"
         lower_src = source_name.lower()
         if "check point" in lower_src or "checkpoint" in lower_src:
-            vendor = "Check Point"
-            products = ["Security Gateway", "Quantum Security Gateway", "VPN Client", "Identity Awareness", "SmartConsole"]
-            product = random.choice(products)
-            vuln_types = [
-                "Remote Code Execution (RCE) via crafted payloads",
-                "Information Disclosure leading to credential exposure",
-                "Authentication Bypass vulnerability in management portal",
-                "Denial of Service (DoS) vulnerability via buffer overflow",
-                "Privilege Escalation in local OS kernel"
-            ]
-            title = f"Check Point {product} - {random.choice(vuln_types)}"
-            description = (
-                f"An advisory was published on the Check Point support portal for {product}. "
-                f"Attackers could exploit this security flaw ({cve_id}) to disrupt network operations or bypass security checks. "
-                "Administrators are highly advised to apply hotfixes immediately."
-            )
+            vendor, product = "Check Point", "Security Gateway"
         elif "fortinet" in lower_src or "fortios" in lower_src:
-            vendor = "Fortinet"
-            product = "FortiOS"
-            title = "FortiOS SSL-VPN Buffer Overflow leading to remote arbitrary code execution"
-            description = "An out-of-bounds write vulnerability [CWE-787] in FortiOS SSL-VPN allows a remote unauthenticated attacker to execute arbitrary code or command sequences via crafted requests."
+            vendor, product = "Fortinet", "FortiOS"
         elif "cisa" in lower_src:
-            vendor = "Various"
-            product = "Active Exploded Vulnerability"
-            title = "CISA Known Exploited Vulnerability Catalog Entry"
-            description = "CISA has added this vulnerability to its Known Exploited Vulnerabilities catalog based on evidence of active exploitation in the wild."
+            vendor, product = "Various", "Known Exploited Vulnerability"
 
-        severities = ["Medium", "High", "Critical"]
-        weights = [0.2, 0.5, 0.3]
-        severity = random.choices(severities, weights=weights)[0]
-        
-        # Query real EPSS score from FIRST.org API
+        nvd = RSSIngestionService.fetch_nvd_details(cve_id)
         real_epss = RSSIngestionService.fetch_real_epss_score(cve_id)
-        
-        if severity == "Critical":
-            cvss_score = round(random.uniform(9.0, 10.0), 1)
-            epss = real_epss if real_epss > 0 else round(random.uniform(0.70, 0.98), 4)
-        elif severity == "High":
-            cvss_score = round(random.uniform(7.0, 8.9), 1)
-            epss = real_epss if real_epss > 0 else round(random.uniform(0.15, 0.69), 4)
+
+        if nvd:
+            title = nvd["description"][:200]
+            description = nvd["description"]
+            severity = nvd["severity"]
+            cvss_score = nvd["cvss_score"]
+            if nvd["vendor"] not in (None, "Various"):
+                vendor, product = nvd["vendor"], nvd["product"]
         else:
-            cvss_score = round(random.uniform(4.0, 6.9), 1)
-            epss = real_epss if real_epss > 0 else round(random.uniform(0.01, 0.14), 4)
-            
+            title = f"{cve_id} — referenced on {source_name} advisory page"
+            description = (
+                f"{cve_id} was found on the {source_name} advisory page ({source_url}). "
+                "Not yet published in the NVD, so no CVSS score or severity is available."
+            )
+            severity, cvss_score = None, None
+
         return {
             "cve_id": cve_id,
             "title": title,
             "description": description,
             "severity": severity,
             "cvss_score": cvss_score,
-            "epss": epss,
+            "epss": real_epss if real_epss > 0 else None,
             "published_date": datetime.utcnow(),
             "updated_date": datetime.utcnow(),
             "vendor": vendor,

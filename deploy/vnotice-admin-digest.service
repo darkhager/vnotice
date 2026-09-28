@@ -1,0 +1,9 @@
+[Unit]
+Description=Vnotice admin summary: one Teams card of all new CVEs (every feed) to the admin webhook(s)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/vnotice/vnotice/backend
+ExecStart=/home/vnotice/vnotice/backend/venv_server/bin/python /home/vnotice/vnotice/backend/admin_digest.py
+StandardOutput=append:/home/vnotice/admin-digest.log
+StandardError=append:/home/vnotice/admin-digest.log

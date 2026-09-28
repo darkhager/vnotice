@@ -20,7 +20,7 @@ from database import SessionLocal
 import models
 import auth
 
-API = os.getenv("VNOTICE_API", "http://127.0.0.1:8080")
+API = os.getenv("VNOTICE_API", "http://127.0.0.1:8080")   # must match the backend's scheme
 SVC_EMAIL = "auto-sync@vnotice.local"
 
 FEEDS = [
